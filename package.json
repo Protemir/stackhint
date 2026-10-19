@@ -1,0 +1,54 @@
+{
+  "name": "stackhint",
+  "version": "0.1.0",
+  "description": "Recommends MCP servers, plugins, skills and CLIs that fit your repo, for Claude Code and Codex. Local, offline, asks before it changes anything.",
+  "type": "module",
+  "bin": {
+    "stackhint": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "registry",
+    "skills",
+    "hooks",
+    ".claude-plugin",
+    ".agents",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:check": "node scripts/build.mjs --check",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "node scripts/lint.mjs",
+    "test": "node --test --test-concurrency=4 \"tests/**/*.test.ts\"",
+    "test:dist": "node --test \"tests/dist.smoke.test.mjs\"",
+    "demo": "node dist/cli.js recommend examples/dotnet-shop"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude-code",
+    "codex",
+    "agent-skills",
+    "developer-tools",
+    "cli"
+  ],
+  "author": "Protemir",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Protemir/stackhint.git"
+  },
+  "homepage": "https://github.com/Protemir/stackhint#readme",
+  "bugs": {
+    "url": "https://github.com/Protemir/stackhint/issues"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "typescript": "5.9.3"
+  }
+}

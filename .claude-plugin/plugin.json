@@ -1,0 +1,13 @@
+{
+  "name": "stackhint",
+  "version": "0.1.0",
+  "description": "Suggests MCP servers, plugins, skills and CLIs that fit your repo and task, checks the ones you already have, and installs only after you confirm.",
+  "author": {
+    "name": "Protemir",
+    "url": "https://github.com/Protemir"
+  },
+  "homepage": "https://github.com/Protemir/stackhint",
+  "repository": "https://github.com/Protemir/stackhint",
+  "license": "MIT",
+  "keywords": ["mcp", "recommendations", "skills", "plugins", "codex", "developer-tools"]
+}

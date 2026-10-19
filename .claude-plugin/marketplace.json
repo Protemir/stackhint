@@ -1,0 +1,18 @@
+{
+  "name": "stackhint",
+  "description": "stackhint: tool recommendations for Claude Code and Codex, from your repo.",
+  "owner": {
+    "name": "Protemir",
+    "url": "https://github.com/Protemir"
+  },
+  "plugins": [
+    {
+      "name": "stackhint",
+      "source": "./",
+      "description": "Suggests MCP servers, plugins, skills and CLIs that fit your repo and task. Local and offline; installs only after you confirm.",
+      "version": "0.1.0",
+      "category": "productivity",
+      "homepage": "https://github.com/Protemir/stackhint"
+    }
+  ]
+}

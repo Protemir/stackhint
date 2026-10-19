@@ -1,0 +1,20 @@
+{
+  "name": "stackhint",
+  "interface": {
+    "displayName": "stackhint"
+  },
+  "plugins": [
+    {
+      "name": "stackhint",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

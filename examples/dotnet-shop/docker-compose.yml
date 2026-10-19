@@ -1,0 +1,7 @@
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: shop
+  cache:
+    image: redis:7-alpine

@@ -1,0 +1,558 @@
+// A small TOML 1.0 reader and a writer for the narrow shapes stackhint appends to
+// Codex's config.toml. The reader is strict about the things that matter for safe
+// merging (duplicate keys, table redefinition, extending inline tables) and returns
+// dates/times as strings.
+
+export class TomlError extends Error {
+  readonly line: number;
+  constructor(message: string, line: number) {
+    super(`${message} (line ${line})`);
+    this.name = 'TomlError';
+    this.line = line;
+  }
+}
+
+type TomlTable = Record<string, unknown>;
+
+// Tables we created via [header] or dotted keys, and those that are frozen (inline / values).
+const DEFINED = Symbol('defined');
+const IMPLICIT = Symbol('implicit');
+const FROZEN = Symbol('frozen');
+const ARRAY_OF_TABLES = Symbol('aot');
+const HEADER = Symbol('header');
+
+interface Meta {
+  [HEADER]?: boolean;
+  [DEFINED]?: boolean;
+  [IMPLICIT]?: boolean;
+  [FROZEN]?: boolean;
+}
+
+function newTable(): TomlTable {
+  return Object.create(null) as TomlTable;
+}
+
+function isTable(v: unknown): v is TomlTable {
+  return typeof v === 'object' && v !== null && !Array.isArray(v) && !(v instanceof Date);
+}
+
+function meta(t: TomlTable): Meta {
+  return t as unknown as Meta;
+}
+
+class Parser {
+  private readonly src: string;
+  private pos = 0;
+  private line = 1;
+  private readonly root: TomlTable = newTable();
+  private current: TomlTable;
+
+  constructor(src: string) {
+    this.src = src.replace(/^﻿/, '');
+    this.current = this.root;
+  }
+
+  parse(): TomlTable {
+    while (this.pos < this.src.length) {
+      this.skipWsCommentsNewlines();
+      if (this.pos >= this.src.length) break;
+      const c = this.src[this.pos];
+      if (c === '[') {
+        if (this.src[this.pos + 1] === '[') this.parseArrayTableHeader();
+        else this.parseTableHeader();
+      } else {
+        this.parseKeyValue(this.current);
+      }
+      this.expectLineEnd();
+    }
+    return toPlain(this.root) as TomlTable;
+  }
+
+  private err(msg: string): never {
+    throw new TomlError(msg, this.line);
+  }
+
+  private peek(offset = 0): string {
+    return this.src[this.pos + offset] ?? '';
+  }
+
+  private skipWs(): void {
+    while (this.peek() === ' ' || this.peek() === '\t') this.pos++;
+  }
+
+  private skipComment(): void {
+    if (this.peek() === '#') {
+      while (this.pos < this.src.length && this.peek() !== '\n') {
+        const ch = this.peek();
+        const code = ch.charCodeAt(0);
+        if ((code < 0x20 && ch !== '\t' && ch !== '\r') || code === 0x7f) this.err('control character in comment');
+        this.pos++;
+      }
+    }
+  }
+
+  private skipNewline(): boolean {
+    if (this.peek() === '\n') {
+      this.pos++;
+      this.line++;
+      return true;
+    }
+    if (this.peek() === '\r' && this.peek(1) === '\n') {
+      this.pos += 2;
+      this.line++;
+      return true;
+    }
+    return false;
+  }
+
+  private skipWsCommentsNewlines(): void {
+    for (;;) {
+      this.skipWs();
+      this.skipComment();
+      if (!this.skipNewline()) break;
+    }
+  }
+
+  private expectLineEnd(): void {
+    this.skipWs();
+    this.skipComment();
+    if (this.pos >= this.src.length) return;
+    if (!this.skipNewline()) this.err(`unexpected character '${this.peek()}'`);
+  }
+
+  // ----- keys -----
+
+  private parseKey(): string[] {
+    const parts: string[] = [];
+    for (;;) {
+      this.skipWs();
+      parts.push(this.parseSimpleKey());
+      this.skipWs();
+      if (this.peek() === '.') {
+        this.pos++;
+        continue;
+      }
+      return parts;
+    }
+  }
+
+  private parseSimpleKey(): string {
+    const c = this.peek();
+    if (c === '"') return this.parseBasicString();
+    if (c === "'") return this.parseLiteralString();
+    const start = this.pos;
+    while (/[A-Za-z0-9_-]/.test(this.peek())) this.pos++;
+    if (start === this.pos) this.err('expected a key');
+    return this.src.slice(start, this.pos);
+  }
+
+  // ----- headers -----
+
+  private parseTableHeader(): void {
+    this.pos++; // [
+    const key = this.parseKey();
+    if (this.peek() !== ']') this.err("expected ']'");
+    this.pos++;
+    let t = this.root;
+    key.forEach((k, i) => {
+      const last = i === key.length - 1;
+      let next = t[k];
+      if (next === undefined) {
+        next = newTable();
+        if (!last) meta(next as TomlTable)[IMPLICIT] = true;
+        t[k] = next;
+      } else if (Array.isArray(next) && (next as unknown as { [ARRAY_OF_TABLES]?: boolean })[ARRAY_OF_TABLES]) {
+        if (last) this.err(`cannot redefine array of tables '${key.join('.')}' as a table`);
+        next = next[next.length - 1];
+      } else if (!isTable(next)) {
+        this.err(`key '${k}' is already a value`);
+      }
+      const nt = next as TomlTable;
+      if (meta(nt)[FROZEN]) this.err(`cannot extend inline table '${key.slice(0, i + 1).join('.')}'`);
+      if (last) {
+        if (meta(nt)[DEFINED]) this.err(`table '${key.join('.')}' defined twice`);
+        meta(nt)[DEFINED] = true;
+        meta(nt)[HEADER] = true;
+        meta(nt)[IMPLICIT] = false;
+      }
+      t = nt;
+    });
+    this.current = t;
+  }
+
+  private parseArrayTableHeader(): void {
+    this.pos += 2; // [[
+    const key = this.parseKey();
+    if (this.peek() !== ']' || this.peek(1) !== ']') this.err("expected ']]'");
+    this.pos += 2;
+    let t = this.root;
+    key.forEach((k, i) => {
+      const last = i === key.length - 1;
+      let next = t[k];
+      if (last) {
+        if (next === undefined) {
+          const arr: unknown[] = [];
+          (arr as unknown as { [ARRAY_OF_TABLES]: boolean })[ARRAY_OF_TABLES] = true;
+          t[k] = arr;
+          next = arr;
+        } else if (!Array.isArray(next) || !(next as unknown as { [ARRAY_OF_TABLES]?: boolean })[ARRAY_OF_TABLES]) {
+          this.err(`'${key.join('.')}' is not an array of tables`);
+        }
+        const tbl = newTable();
+        meta(tbl)[DEFINED] = true;
+        meta(tbl)[HEADER] = true;
+        (next as unknown[]).push(tbl);
+        t = tbl;
+        return;
+      }
+      if (next === undefined) {
+        next = newTable();
+        meta(next as TomlTable)[IMPLICIT] = true;
+        t[k] = next;
+      } else if (Array.isArray(next) && (next as unknown as { [ARRAY_OF_TABLES]?: boolean })[ARRAY_OF_TABLES]) {
+        next = next[next.length - 1];
+      } else if (!isTable(next)) {
+        this.err(`key '${k}' is already a value`);
+      }
+      if (meta(next as TomlTable)[FROZEN]) this.err(`cannot extend inline table '${k}'`);
+      t = next as TomlTable;
+    });
+    this.current = t;
+  }
+
+  // ----- key/value -----
+
+  private parseKeyValue(target: TomlTable, inline = false): void {
+    const key = this.parseKey();
+    this.skipWs();
+    if (this.peek() !== '=') this.err("expected '=' after key");
+    this.pos++;
+    this.skipWs();
+    const value = this.parseValue();
+    let t = target;
+    for (let i = 0; i < key.length - 1; i++) {
+      const k = key[i] as string;
+      let next = t[k];
+      if (next === undefined) {
+        next = newTable();
+        // Dotted keys define the intermediate tables; a later [header] for them is an error.
+        meta(next as TomlTable)[DEFINED] = true;
+        t[k] = next;
+      } else if (!isTable(next)) {
+        this.err(`key '${k}' is already a value`);
+      } else if (meta(next)[FROZEN]) {
+        this.err(`cannot extend inline table '${k}'`);
+      } else if (!inline && meta(next)[HEADER]) {
+        this.err(`cannot add dotted key into table '${k}' defined by a header`);
+      }
+      t = next as TomlTable;
+    }
+    const last = key[key.length - 1] as string;
+    if (Object.prototype.hasOwnProperty.call(t, last)) this.err(`duplicate key '${key.join('.')}'`);
+    t[last] = value;
+  }
+
+  private parseValue(): unknown {
+    const c = this.peek();
+    if (c === '"') {
+      if (this.src.startsWith('"""', this.pos)) return this.parseMultilineBasicString();
+      return this.parseBasicString();
+    }
+    if (c === "'") {
+      if (this.src.startsWith("'''", this.pos)) return this.parseMultilineLiteralString();
+      return this.parseLiteralString();
+    }
+    if (c === '[') return this.parseArray();
+    if (c === '{') return this.parseInlineTable();
+    if (this.src.startsWith('true', this.pos) && !/[A-Za-z0-9_-]/.test(this.peek(4))) {
+      this.pos += 4;
+      return true;
+    }
+    if (this.src.startsWith('false', this.pos) && !/[A-Za-z0-9_-]/.test(this.peek(5))) {
+      this.pos += 5;
+      return false;
+    }
+    return this.parseNumberOrDate();
+  }
+
+  private parseBasicString(): string {
+    this.pos++; // "
+    let out = '';
+    for (;;) {
+      const c = this.peek();
+      if (c === '') this.err('unterminated string');
+      if (c === '\n' || c === '\r') this.err('newline in basic string');
+      if (c === '"') {
+        this.pos++;
+        return out;
+      }
+      if (c === '\\') {
+        out += this.parseEscape();
+        continue;
+      }
+      const code = c.charCodeAt(0);
+      if ((code < 0x20 && c !== '\t') || code === 0x7f) this.err('control character in string');
+      out += c;
+      this.pos++;
+    }
+  }
+
+  private parseEscape(): string {
+    this.pos++; // backslash
+    const c = this.peek();
+    this.pos++;
+    switch (c) {
+      case 'b':
+        return '\b';
+      case 't':
+        return '\t';
+      case 'n':
+        return '\n';
+      case 'f':
+        return '\f';
+      case 'r':
+        return '\r';
+      case 'e':
+        return '\u001b';
+      case '"':
+        return '"';
+      case '\\':
+        return '\\';
+      case 'u':
+      case 'U': {
+        const len = c === 'u' ? 4 : 8;
+        const hex = this.src.slice(this.pos, this.pos + len);
+        if (!new RegExp(`^[0-9A-Fa-f]{${len}}$`).test(hex)) this.err('invalid unicode escape');
+        this.pos += len;
+        const cp = parseInt(hex, 16);
+        if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) this.err('invalid unicode scalar');
+        return String.fromCodePoint(cp);
+      }
+      default:
+        return this.err(`invalid escape '\\${c}'`);
+    }
+  }
+
+  private parseMultilineBasicString(): string {
+    this.pos += 3;
+    this.skipNewline();
+    let out = '';
+    for (;;) {
+      if (this.pos >= this.src.length) this.err('unterminated multi-line string');
+      if (this.src.startsWith('"""', this.pos)) {
+        // Up to two extra quotes may belong to the content.
+        let extra = 0;
+        while (this.peek(3 + extra) === '"' && extra < 2) extra++;
+        out += '"'.repeat(extra);
+        this.pos += 3 + extra;
+        return out;
+      }
+      const c = this.peek();
+      if (c === '\\') {
+        // Line-ending backslash trims following whitespace and newlines.
+        let j = this.pos + 1;
+        while (this.src[j] === ' ' || this.src[j] === '\t') j++;
+        if (this.src[j] === '\n' || (this.src[j] === '\r' && this.src[j + 1] === '\n')) {
+          this.pos = j;
+          while (this.peek() === ' ' || this.peek() === '\t' || this.peek() === '\n' || this.peek() === '\r') {
+            if (this.peek() === '\n') this.line++;
+            this.pos++;
+          }
+          continue;
+        }
+        out += this.parseEscape();
+        continue;
+      }
+      if (c === '\n') this.line++;
+      const code = c.charCodeAt(0);
+      if ((code < 0x20 && c !== '\t' && c !== '\n' && c !== '\r') || code === 0x7f) this.err('control character in string');
+      out += c;
+      this.pos++;
+    }
+  }
+
+  private parseLiteralString(): string {
+    this.pos++;
+    const start = this.pos;
+    for (;;) {
+      const c = this.peek();
+      if (c === '') this.err('unterminated literal string');
+      if (c === '\n' || c === '\r') this.err('newline in literal string');
+      if (c === "'") break;
+      const code = c.charCodeAt(0);
+      if ((code < 0x20 && c !== '\t') || code === 0x7f) this.err('control character in string');
+      this.pos++;
+    }
+    const s = this.src.slice(start, this.pos);
+    this.pos++;
+    return s;
+  }
+
+  private parseMultilineLiteralString(): string {
+    this.pos += 3;
+    this.skipNewline();
+    const start = this.pos;
+    for (;;) {
+      if (this.pos >= this.src.length) this.err('unterminated multi-line literal string');
+      if (this.src.startsWith("'''", this.pos)) {
+        let extra = 0;
+        while (this.peek(3 + extra) === "'" && extra < 2) extra++;
+        const s = this.src.slice(start, this.pos + extra);
+        this.pos += 3 + extra;
+        return s;
+      }
+      if (this.peek() === '\n') this.line++;
+      this.pos++;
+    }
+  }
+
+  private parseArray(): unknown[] {
+    this.pos++; // [
+    const out: unknown[] = [];
+    for (;;) {
+      this.skipWsCommentsNewlines();
+      if (this.peek() === ']') {
+        this.pos++;
+        return out;
+      }
+      out.push(this.parseValue());
+      this.skipWsCommentsNewlines();
+      if (this.peek() === ',') {
+        this.pos++;
+        continue;
+      }
+      if (this.peek() === ']') {
+        this.pos++;
+        return out;
+      }
+      this.err("expected ',' or ']' in array");
+    }
+  }
+
+  private parseInlineTable(): TomlTable {
+    this.pos++; // {
+    const t = newTable();
+    this.skipWsCommentsNewlines();
+    if (this.peek() === '}') {
+      this.pos++;
+      meta(t)[FROZEN] = true;
+      return t;
+    }
+    for (;;) {
+      this.skipWsCommentsNewlines();
+      this.parseKeyValue(t, true);
+      this.skipWsCommentsNewlines();
+      if (this.peek() === ',') {
+        this.pos++;
+        this.skipWsCommentsNewlines();
+        if (this.peek() === '}') {
+          // Trailing comma (TOML 1.1). Accepted for leniency.
+          this.pos++;
+          break;
+        }
+        continue;
+      }
+      if (this.peek() === '}') {
+        this.pos++;
+        break;
+      }
+      this.err("expected ',' or '}' in inline table");
+    }
+    freeze(t);
+    return t;
+  }
+
+  private parseNumberOrDate(): unknown {
+    const start = this.pos;
+    while (this.pos < this.src.length && /[0-9A-Za-z_+\-.:]/.test(this.peek())) this.pos++;
+    // Dates may contain a single space between date and time.
+    if (/^\d{4}-\d{2}-\d{2}$/.test(this.src.slice(start, this.pos)) && this.peek() === ' ' && /\d/.test(this.peek(1))) {
+      this.pos++;
+      while (this.pos < this.src.length && /[0-9A-Za-z_+\-.:]/.test(this.peek())) this.pos++;
+    }
+    const raw = this.src.slice(start, this.pos);
+    if (raw === '') this.err('expected a value');
+    if (/^[+-]?(inf|nan)$/.test(raw)) return raw.includes('nan') ? NaN : raw.startsWith('-') ? -Infinity : Infinity;
+    if (/^\d{4}-\d{2}-\d{2}([Tt ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?([Zz]|[+-]\d{2}:\d{2})?$/.test(raw) || /^\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(raw)) {
+      return raw;
+    }
+    if (/^0x[0-9A-Fa-f](_?[0-9A-Fa-f])*$/.test(raw)) return parseInt(raw.slice(2).replace(/_/g, ''), 16);
+    if (/^0o[0-7](_?[0-7])*$/.test(raw)) return parseInt(raw.slice(2).replace(/_/g, ''), 8);
+    if (/^0b[01](_?[01])*$/.test(raw)) return parseInt(raw.slice(2).replace(/_/g, ''), 2);
+    if (/^[+-]?(0|[1-9](_?\d)*)$/.test(raw)) return Number(raw.replace(/_/g, ''));
+    if (/^[+-]?(0|[1-9](_?\d)*)(\.\d(_?\d)*)?([eE][+-]?\d(_?\d)*)?$/.test(raw)) return Number(raw.replace(/_/g, ''));
+    return this.err(`invalid value '${raw}'`);
+  }
+}
+
+function freeze(t: TomlTable): void {
+  meta(t)[FROZEN] = true;
+  for (const v of Object.values(t)) {
+    if (isTable(v)) freeze(v);
+    else if (Array.isArray(v)) v.forEach((x) => isTable(x) && freeze(x));
+  }
+}
+
+/** Convert parser tables (null-prototype, with symbol markers) into plain objects. */
+function toPlain(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(toPlain);
+  if (isTable(v)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, x] of Object.entries(v)) out[k] = toPlain(x);
+    return out;
+  }
+  return v;
+}
+
+export function parseToml(src: string): Record<string, unknown> {
+  return new Parser(src).parse();
+}
+
+// ----- writer -----
+
+const BARE_KEY = /^[A-Za-z0-9_-]+$/;
+
+export function tomlKey(k: string): string {
+  return BARE_KEY.test(k) ? k : tomlString(k);
+}
+
+export function tomlString(s: string): string {
+  let out = '"';
+  for (const ch of s) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (ch === '"') out += '\\"';
+    else if (ch === '\\') out += '\\\\';
+    else if (ch === '\n') out += '\\n';
+    else if (ch === '\r') out += '\\r';
+    else if (ch === '\t') out += '\\t';
+    else if (code < 0x20 || code === 0x7f) out += '\\u' + code.toString(16).padStart(4, '0');
+    else out += ch;
+  }
+  return out + '"';
+}
+
+export type TomlScalar = string | number | boolean;
+export type TomlWritable = TomlScalar | TomlScalar[] | Record<string, TomlScalar>;
+
+export function tomlValue(v: TomlWritable): string {
+  if (typeof v === 'string') return tomlString(v);
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (typeof v === 'number') {
+    if (!Number.isFinite(v)) throw new Error('cannot write non-finite number');
+    return String(v);
+  }
+  if (Array.isArray(v)) return '[' + v.map((x) => tomlValue(x)).join(', ') + ']';
+  const entries = Object.entries(v);
+  if (entries.length === 0) return '{}';
+  return '{ ' + entries.map(([k, x]) => `${tomlKey(k)} = ${tomlValue(x)}`).join(', ') + ' }';
+}
+
+/** Render a [a.b] table with simple values. Keys keep insertion order. */
+export function tomlTable(path: string[], values: Record<string, TomlWritable | undefined>): string {
+  const lines = [`[${path.map(tomlKey).join('.')}]`];
+  for (const [k, v] of Object.entries(values)) {
+    if (v === undefined) continue;
+    lines.push(`${tomlKey(k)} = ${tomlValue(v)}`);
+  }
+  return lines.join('\n');
+}
