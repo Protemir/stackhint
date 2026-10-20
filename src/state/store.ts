@@ -216,7 +216,15 @@ export class Store {
   }
 
   projectKey(root: string): string {
-    return createHash('sha256').update(comparablePath(root)).digest('hex').slice(0, 16);
+    // The real path: on macOS /var is a link to /private/var, and a session opened through a
+    // linked folder must get the same key as a shell whose cwd is already resolved.
+    let real = root;
+    try {
+      real = fs.realpathSync.native(root);
+    } catch {
+      /* missing folder: use the path as given */
+    }
+    return createHash('sha256').update(comparablePath(real)).digest('hex').slice(0, 16);
   }
 
   isDismissed(state: State, id: string, projectKey: string): Dismissal | undefined {
