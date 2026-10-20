@@ -57,3 +57,31 @@ jobs:
       - run: node --test tests/host-real.test.ts
         env:
           STACKHINT_REAL_HOSTS: '1'
+
+  install-from-github:
+    name: install from GitHub (${{ matrix.os }})
+    if: github.event_name == 'push'
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: npx from GitHub
+        shell: bash
+        run: |
+          out=$(npx -y "github:${GITHUB_REPOSITORY}#${GITHUB_SHA}" --version)
+          echo "$out"
+          test -n "$out"
+      - name: Codex marketplace from GitHub
+        shell: bash
+        run: |
+          npm install -g @openai/codex
+          export CODEX_HOME="$RUNNER_TEMP/codex-home" && mkdir -p "$CODEX_HOME"
+          codex plugin marketplace add "${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+          codex plugin list --available --json | tee list.json
+          grep -q stackhint list.json
