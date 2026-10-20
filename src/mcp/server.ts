@@ -109,10 +109,12 @@ function hostArg(v: unknown): HostId | 'all' | undefined {
 /** The path argument comes from a model: local directories only, no network shares or devices. */
 export function safeProjectPath(p: string | undefined, fallback: string): string | { error: string } {
   if (p === undefined) return fallback;
-  if (/^(\\\\|\/\/)/.test(p) || /^\\\\\?\\/.test(p) || /^[a-z][a-z0-9+.-]*:\/\//i.test(p) || p.includes('\0')) {
+  // Two leading slashes of any kind (\\host, //host, \/host, /\host) mean a network path on Windows.
+  if (/^[\\/]{2}/.test(p) || /^[a-z][a-z0-9+.-]*:\/\//i.test(p) || p.includes('\0')) {
     return { error: 'path must be a local directory (no network shares or URLs)' };
   }
   const resolved = path.resolve(fallback, p);
+  if (/^[\\/]{2}/.test(resolved)) return { error: 'path must be a local directory (no network shares or URLs)' };
   try {
     if (!fs.statSync(resolved).isDirectory()) return { error: 'path is not a directory' };
   } catch {

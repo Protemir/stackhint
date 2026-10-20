@@ -27,6 +27,18 @@ export function findGitDir(root: string): string | undefined {
   return undefined;
 }
 
+/** The working-tree root: the folder that contains .git (a directory, or a file in worktrees and submodules). */
+export function findWorkTree(start: string): string | undefined {
+  let dir = path.resolve(start);
+  for (let i = 0; i < 40; i++) {
+    if (fs.existsSync(path.join(dir, '.git'))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
 /** Strip credentials from a remote URL. */
 export function cleanRemoteUrl(url: string): string {
   return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/]*@/i, '$1');

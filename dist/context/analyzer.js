@@ -720,7 +720,8 @@ export function pythonManifestNames(rawText        , fileName = 'pyproject.toml'
     let value = kv[2] ?? '';
     // Collect a multi-line array value.
     if (value.trimStart().startsWith('[') && !balanced(value)) {
-      while (i + 1 < lines.length && !balanced(value)) value += '\n' + (lines[++i]          );
+      // Drop comments on continuation lines: an apostrophe in "# don't pin" would open a quote.
+      while (i + 1 < lines.length && !balanced(value)) value += '\n' + stripTomlComment(lines[++i]          );
     }
     if (section === 'project' && (key === 'dependencies' || key === 'optional-dependencies')) {
       for (const r of quotedRequirements(value)) out.add(r);
@@ -731,6 +732,19 @@ export function pythonManifestNames(rawText        , fileName = 'pyproject.toml'
     }
   }
   return [...out];
+}
+
+/** Remove a # comment that is not inside a quoted string. */
+function stripTomlComment(line        )         {
+  let quote = '';
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]          ;
+    if (quote) {
+      if (c === quote) quote = '';
+    } else if (c === '"' || c === "'") quote = c;
+    else if (c === '#') return line.slice(0, i);
+  }
+  return line;
 }
 
 function balanced(s        )          {

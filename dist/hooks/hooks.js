@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { openSession, runRecommend,              } from '../app.js';
-import { findGitDir } from '../context/git.js';
+import { findWorkTree } from '../context/git.js';
 import { classifyTask } from '../context/task.js';
 import { SignalSet } from '../context/signals.js';
 import { recommend } from '../engine/recommend.js';
@@ -37,9 +37,9 @@ import { sanitizeLine } from '../util/text.js';
 export function projectRootFor(input           , env     )         {
   if (env['CLAUDE_PROJECT_DIR']) return env['CLAUDE_PROJECT_DIR'];
   const cwd = input.cwd || process.cwd();
-  const gitDir = findGitDir(cwd);
+  const tree = findWorkTree(cwd);
   // A dotfiles repository in the home folder is not "the project".
-  if (gitDir && path.basename(gitDir) === '.git' && !samePath(path.dirname(gitDir), homeDir(env))) return path.dirname(gitDir);
+  if (tree && !samePath(tree, homeDir(env))) return tree;
   return cwd;
 }
 

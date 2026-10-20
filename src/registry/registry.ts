@@ -52,7 +52,7 @@ const SHELL_META = /[;&|`$<>\\"'%^!\r\n\u0000]/;
 const INVISIBLE = /[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁠-⁤⁦-⁩﻿]/;
 
 /** Literal header and env values: plain words only, no quotes, no $ (no ${VAR} expansion tricks). */
-const SAFE_VALUE = /^[A-Za-z0-9 ._:/=,+@*-]{0,200}$/;
+const SAFE_VALUE = /^[A-Za-z0-9 ._:/=,+@*?~-]{0,200}$/;
 
 /** Programs that would let a registry entry run arbitrary code or fetch-and-execute. */
 const DENIED_COMMANDS = new Set([
@@ -72,15 +72,23 @@ const INSTRUCTION_LIKE =
 function normalizeForScan(s: string): string {
   return s
     .normalize('NFKC')
+    .replace(/\s+/g, ' ') // first: tabs and newlines become spaces, so words are not glued together
     .replace(new RegExp(INVISIBLE.source, 'g'), '')
-    .replace(/\s+/g, ' ')
+    .replace(/ {2,}/g, ' ')
     .toLowerCase();
 }
 
 /** Strip a Windows executable extension and lowercase, so "node.exe" is checked as "node". */
 function commandBase(c: string): string {
-  return c.toLowerCase().replace(/\.(exe|cmd|bat|com|ps1)$/, '');
+  return c
+    .toLowerCase()
+    .replace(/\.(exe|cmd|bat|com|ps1)$/, '')
+    .replace(/-(preview|beta|nightly|dev|canary)$/, '')
+    .replace(/[-_.]?\d[\d._-]*$/, ''); // python3.12, node22, pwsh7 -> python, node, pwsh
 }
+
+/** Interpreters and shells under any versioned name. */
+const INTERPRETER_PREFIX = /^(python|pythonw|py|node|nodejs|pwsh|powershell|perl|ruby|php|bash|zsh|ksh|lua|deno|bun|tclsh)([\d._-]|$)/;
 
 export interface LoadOptions {
   /** Extra registry files (JSON with an entries array), e.g. from ~/.stackhint/registry.d. */
@@ -194,21 +202,32 @@ export function isSafeUrl(url: string): boolean {
 }
 
 /** Every string anywhere in the entry, keys included. */
-function textFieldsOf(raw: Obj): string[] {
+function textFieldsOf(raw: Obj): string[] | undefined {
   const out: string[] = [];
+  let chars = 0;
+  let tooBig = false;
   const walk = (v: unknown, depth: number): void => {
-    if (depth > 8 || out.length > 2000) return;
-    if (typeof v === 'string') out.push(v.slice(0, 5000));
-    else if (Array.isArray(v)) v.forEach((x) => walk(x, depth + 1));
+    if (tooBig) return;
+    if (depth > 8 || out.length > 5000 || chars > 400_000) {
+      tooBig = true;
+      return;
+    }
+    if (typeof v === 'string') {
+      out.push(v);
+      chars += v.length;
+    } else if (Array.isArray(v)) v.forEach((x) => walk(x, depth + 1));
     else if (isObj(v)) {
       for (const [k, x] of Object.entries(v)) {
-        out.push(k.slice(0, 200));
+        out.push(k);
+        chars += k.length;
         walk(x, depth + 1);
       }
     }
+    if (out.length > 5000 || chars > 400_000) tooBig = true;
   };
   walk(raw, 0);
-  return out;
+  // An entry too large or too deep to scan completely is rejected rather than half-checked.
+  return tooBig ? undefined : out;
 }
 
 export function validateEntry(raw: unknown, ctx: ValidateContext = { origin: 'custom', defaultVerifiedAt: '' }): { entry?: RegistryEntry; errors: string[] } {
@@ -225,7 +244,9 @@ export function validateEntry(raw: unknown, ctx: ValidateContext = { origin: 'cu
   const description = sanitize(raw['description'], 600);
   if (!description) return { errors: ['missing description'] };
 
-  const suspicious = textFieldsOf(raw).find((t) => INSTRUCTION_LIKE.test(normalizeForScan(t)));
+  const texts = textFieldsOf(raw);
+  if (!texts) return { errors: ['entry is too large or too deeply nested to check'] };
+  const suspicious = texts.find((t) => INSTRUCTION_LIKE.test(normalizeForScan(t.slice(0, 20_000))));
   if (suspicious) return { errors: ['text contains instruction-like content; entry rejected'] };
 
   const docs = str(raw['docs']) ?? '';
@@ -281,7 +302,7 @@ export function validateEntry(raw: unknown, ctx: ValidateContext = { origin: 'cu
 
   let install: InstallSpec | undefined;
   if (raw['install'] !== undefined) {
-    const res = validateInstall(raw['install']);
+    const res = validateInstall(raw['install'], ctx.origin);
     if (res.error) return { errors: [`install: ${res.error}`] };
     install = res.install;
     if (kind !== 'mcp') return { errors: ['install specs are only valid for kind "mcp"'] };
@@ -408,7 +429,7 @@ export function validateServerSpec(raw: unknown, params: Param[], partial: boole
   if (raw['command'] !== undefined) {
     const c = str(raw['command']);
     if (!c || !EXECUTABLE.test(c)) return { error: 'command must be a bare executable name' };
-    if (DENIED_COMMANDS.has(commandBase(c))) return { error: `command "${c}" is not allowed` };
+    if (DENIED_COMMANDS.has(commandBase(c)) || INTERPRETER_PREFIX.test(c.toLowerCase())) return { error: `command "${c}" is not allowed` };
     spec.command = c;
   }
   if (raw['args'] !== undefined) {
@@ -430,7 +451,11 @@ export function validateServerSpec(raw: unknown, params: Param[], partial: boole
         // Privileges, host namespaces and any mount are refused outright, in every spelling.
         if (/^--(privileged|cap-add|security-opt|device|volumes-from|group-add)(=|$)/.test(a)) return { error: `docker flag ${a} is not allowed` };
         if (/^--(pid|net|network|ipc|uts|userns|cgroupns)(=|$)/.test(a) && (a.endsWith('=host') || next === 'host')) return { error: `docker flag ${a} host is not allowed` };
-        if (/^(-v|--volume|--mount|--tmpfs)(=|$)/.test(a) || /^-v./.test(a)) return { error: 'docker mounts are not allowed in the registry' };
+        if (/^(-v|--volume|--mount|--tmpfs|--env-file)(=|$)/.test(a)) return { error: 'docker mounts and env files are not allowed in the registry' };
+        // Short-flag clusters such as -itv or -tv/:/host also mount volumes.
+        if (/^-[a-z]*v/.test(a) && !a.startsWith('--')) return { error: 'docker mounts are not allowed in the registry' };
+        // A different daemon or context would run the container somewhere else entirely.
+        if (/^(-h|--host|-c|--context)(=|$)/.test(a) || /^-h./.test(a)) return { error: `docker flag ${a} is not allowed` };
       }
     }
     spec.args = args;
@@ -463,7 +488,7 @@ export function validateServerSpec(raw: unknown, params: Param[], partial: boole
   return { spec: spec as ServerSpec };
 }
 
-function validateInstall(raw: unknown): { install?: InstallSpec; error?: string } {
+function validateInstall(raw: unknown, origin: 'builtin' | 'custom' = 'custom'): { install?: InstallSpec; error?: string } {
   if (!isObj(raw)) return { error: 'must be an object' };
   const serverName = str(raw['serverName']);
   if (!serverName || !SERVER_NAME.test(serverName)) return { error: 'serverName must match [A-Za-z0-9_-]' };
@@ -477,7 +502,8 @@ function validateInstall(raw: unknown): { install?: InstallSpec; error?: string 
         description: sanitizeLine(p['description'], 120),
         example: sanitizeLine(p['example'], 120),
       };
-      if (typeof p['pattern'] === 'string') {
+      // Regexes from registry files are only run for the built-in registry; custom entries use the fixed charset.
+      if (typeof p['pattern'] === 'string' && origin === 'builtin') {
         const pattern = p['pattern'];
         // Patterns come from registry files; refuse nested quantifiers that could backtrack for minutes.
         if (pattern.length > 200 || /\([^)]*[+*}][^)]*\)\s*[+*{]/.test(pattern) || /\\[1-9]/.test(pattern)) {

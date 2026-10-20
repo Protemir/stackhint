@@ -22,7 +22,8 @@ export function style(format        , color         )        {
 /** Escape free text for Markdown: no raw HTML, no link/image syntax injection. */
 function t(s       , value        , max = 600)         {
   const v = sanitize(value, max);
-  return s.md ? v.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\[/g, '\\[').replace(/\]/g, '\\]') : v;
+  // Backslash first, so a pre-escaped "\[" cannot turn back into a live link.
+  return s.md ? v.replace(/\\/g, '\\\\').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\[/g, '\\[').replace(/\]/g, '\\]') : v;
 }
 
 function code(s       , value        )         {

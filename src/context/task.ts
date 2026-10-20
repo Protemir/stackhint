@@ -29,7 +29,7 @@ const RULES: Rule[] = [
   [/\bjira\b|джир/i, [['tracker:jira', 0.9], ['task:issue-tracking', 0.8]]],
   [/\bconfluence\b|конфлюенс/i, [['tracker:confluence', 0.9]]],
   // "linear" alone is too common (linear-gradient, linear regression): require tracker context.
-  [/\blinear\b(?!-)(?=.{0,30}\b(issue|ticket|project|board|team|cycle|triage)s?\b)|\b(in|on|from|to) linear\b(?!-)/i, [['tracker:linear', 0.7]]],
+  [/\blinear\b(?!-|\s+(time|scale|regression|algebra|search|gradient|order|fashion|interpolation|combination|equation|model|programming|layout|motion|easing|growth))(?=.{0,30}\b(issue|ticket|board|cycle|triage)s?\b)|\b(linear (issue|ticket|board|cycle|workspace)s?|issues? in linear|tickets? in linear)\b/i, [['tracker:linear', 0.7]]],
   [/\bgithub\b|гитхаб/i, [['vcs:github', 0.9]]],
   [/\bgitlab\b|гитлаб/i, [['vcs:gitlab', 0.9]]],
   [/\bazure devops\b|\bado\b|azure boards|azure pipelines/i, [['vcs:azure-repos', 0.8], ['ci:azure-pipelines', 0.6]]],

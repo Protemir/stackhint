@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { HostId, ProjectContext, Recommendation, Signal } from '../types.ts';
 import { openSession, runRecommend, type Session } from '../app.ts';
-import { findGitDir } from '../context/git.ts';
+import { findWorkTree } from '../context/git.ts';
 import { classifyTask } from '../context/task.ts';
 import { SignalSet } from '../context/signals.ts';
 import { recommend } from '../engine/recommend.ts';
@@ -37,9 +37,9 @@ export interface HookDeps {
 export function projectRootFor(input: HookInput, env: Env): string {
   if (env['CLAUDE_PROJECT_DIR']) return env['CLAUDE_PROJECT_DIR'];
   const cwd = input.cwd || process.cwd();
-  const gitDir = findGitDir(cwd);
+  const tree = findWorkTree(cwd);
   // A dotfiles repository in the home folder is not "the project".
-  if (gitDir && path.basename(gitDir) === '.git' && !samePath(path.dirname(gitDir), homeDir(env))) return path.dirname(gitDir);
+  if (tree && !samePath(tree, homeDir(env))) return tree;
   return cwd;
 }
 
