@@ -297,7 +297,7 @@ The engine knows nothing about host config formats; adapters turn configs into a
 npm install          # TypeScript and @types/node, for type checking only
 npm run typecheck
 npm run lint
-npm test             # 230+ tests: node --test on the TypeScript sources (Node 22.18+)
+npm test             # 270+ tests: node --test on the TypeScript sources (Node 22.18+)
 npm run build        # writes dist/
 npm run test:dist    # smoke tests on the built JavaScript (works on Node 20)
 ```
