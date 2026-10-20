@@ -96,7 +96,9 @@ export function readJson             (p        , maxBytes = 8 * 1024 * 1024)    
   try {
     return { ok: true, value: JSON.parse(text)      };
   } catch (e) {
-    return { ok: false, error: `invalid JSON: ${(e         ).message}`, missing: false };
+    // V8's message quotes the start of the file; a linked file could hold a token. Keep the position only.
+    const at = /position (\d+)|line (\d+) column (\d+)/.exec((e         ).message);
+    return { ok: false, error: `invalid JSON${at ? (at[1] ? ` at position ${at[1]}` : ` at line ${at[2]} column ${at[3]}`) : ''}`, missing: false };
   }
 }
 

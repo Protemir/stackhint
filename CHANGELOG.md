@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.1 (2026-10-20)
+
+A security and quality pass: a review of hostile repositories, a run over every registry entry (about 16 000 command runs and 630 install/rollback round trips) and a run on 15 public projects.
+
+Security
+- `git log` on a scanned repository can no longer run a program through a partial clone (a missing commit fetched lazily ran the repository's `core.sshCommand`). All fetches are off and a bare repository planted in a subfolder is ignored. Repositories whose git files point at a network share (gitfile, commondir, config includes, alternates, mailmap) get no history instead of a connection to someone's server.
+- Names and paths from a scanned project (server and skill names, file paths, package names) are shown as names: no tags, no terminal escape sequences, no live Markdown, and a "name" that reads like an instruction is hidden. Hook context and `tooling_status` say that quoted names are data, not instructions.
+- Configured servers are recognised by the program they actually launch (the package after npx/uvx/dnx, the image after docker run, the script after node), not by any argument: `npx evil-pkg @playwright/mcp`, look-alike hosts such as `mcp.sentry.dev.evil.example` and a URL passed to an unknown program no longer count as the real tool. Windows `.exe`/`.cmd` launchers, paths with spaces and registry-prefixed images are recognised.
+- The Markdown install plan quotes the `claude mcp add` command like the text output, so a copied `${TOKEN}` cannot expand into a real secret in `~/.claude.json`.
+- A folder name that any of bash, PowerShell or cmd.exe would interpret (`$`, backticks, `%`, `!`, typographic quotes) is not printed into a suggested command; diff blocks use a fence the content cannot close; JSON parse errors no longer quote the start of the file.
+- A pyproject.toml with thousands of blank lines or a folder with 40 000 skills can no longer stall the hooks.
+
+Recommendations
+- One stray file (a Homebrew formula, an editor config) or a manifest without code (`docs/requirements.txt`, a CocoaPods Gemfile) no longer makes a language the project's language, and a few files next to a big codebase stay a side language.
+- Repeating the same kind of hint no longer adds up to certainty, and "Why now" quotes the strongest evidence instead of the first one found.
+- Issue keys in commits no longer count as Jira on their own.
+- A server that is configured but not active (an untrusted Codex project, a disabled server) is no longer recommended again; the plan says how to enable it.
+- `recommend --all` lists everything, and a cut list says how many more there are.
+- Rolling back installs in the wrong order names the later install instead of silently dropping it.
+
+Smaller fixes
+- Sessions opened in a drive root or the home folder are not scanned (the hook returned after 2-3 s; now at once).
+- `.env.production.sample` and similar names are read; `DB_CONNECTION=mysql` is understood; Cloudflare Turnstile keys, `# nosemgrep` comments, Angular templates and `example-apps/` folders no longer mislead.
+- `status --format json` respects `--host`; `try --format json` works for every entry; `dnx` gets the `cmd /c` wrapper on Windows; the Expo server belongs to the Expo MCP entry, not to the plugin.
+
 ## 0.2.0 (2026-10-20)
 
 A bug-hunting pass over 0.1.0 (three independent reviews, 34 confirmed findings, each with a regression test) and a registry twice as large.

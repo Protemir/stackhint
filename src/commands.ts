@@ -122,17 +122,21 @@ export async function cmdScan(io: IO, o: { path?: string; format?: string; task?
 export async function cmdRecommend(io: IO, o: { path?: string; task?: string; host?: string; format?: string; limit?: string; minScore?: string; all?: boolean }): Promise<number> {
   const format = fmt(o.format);
   const s = await session(io, o.path, { ...(o.task ? { task: o.task } : {}), ...(o.host ? { host: o.host } : {}) });
-  const limit = o.limit ? Number(o.limit) : 8;
+  // --all means everything; otherwise the top 8 unless --limit says otherwise.
+  const limit = o.limit ? Number(o.limit) : o.all ? 500 : 8;
   const minScore = o.minScore !== undefined ? Number(o.minScore) : o.all ? 0 : undefined;
   if (!Number.isFinite(limit) || limit < 1) throw new UsageError('--limit must be a positive number');
   if (minScore !== undefined && (!Number.isFinite(minScore) || minScore < 0 || minScore > 100)) throw new UsageError('--min-score must be 0..100');
-  const r = runRecommend(s, { limit, ...(minScore !== undefined ? { minScore } : {}), includeDismissed: Boolean(o.all) });
+  const full = runRecommend(s, { limit: 500, ...(minScore !== undefined ? { minScore } : {}), includeDismissed: Boolean(o.all) });
+  const r = { ...full, recommendations: full.recommendations.slice(0, limit) };
+  const more = full.recommendations.length - r.recommendations.length;
   if (format === 'json') {
     json(io, {
       version: VERSION,
       root: s.root,
       hosts: s.hosts,
       task: s.ctx.task ?? null,
+      more,
       recommendations: r.recommendations.map(recommendationJson),
       alreadyAvailable: r.alreadyAvailable.map(recommendationJson),
       suppressed: r.suppressed,
@@ -143,6 +147,7 @@ export async function cmdRecommend(io: IO, o: { path?: string; task?: string; ho
   }
   warn(io, s, format);
   io.out(renderRecommendations(style(format, io.color), s.ctx, s.hosts, r.recommendations, r.alreadyAvailable, o.path ? { projectArg: o.path } : {}));
+  if (more > 0) io.out(`${more} more above the score threshold; see them with --limit ${limit + more}.`);
   return 0;
 }
 
@@ -250,14 +255,16 @@ export async function cmdStatus(io: IO, o: { path?: string; host?: string; forma
   const format = fmt(o.format);
   const s = await session(io, o.path, { ...(o.host ? { host: o.host } : {}), skipScan: true });
   if (format === 'json') {
+    // Same host filter as the text output.
+    const mine = <T extends { host: HostId }>(xs: T[]): T[] => xs.filter((x) => s.hosts.includes(x.host));
     json(io, {
       hosts: s.hosts,
       hostsDetected: s.inventory.hostsDetected,
-      servers: s.inventory.servers.map((x) => redactDeep({ ...x, args: x.args })),
-      plugins: s.inventory.plugins,
-      skills: s.inventory.skills,
+      servers: mine(s.inventory.servers).map((x) => redactDeep({ ...x, args: x.args })),
+      plugins: mine(s.inventory.plugins),
+      skills: mine(s.inventory.skills),
       executables: Object.keys(s.inventory.executables),
-      files: s.inventory.files,
+      files: mine(s.inventory.files),
       note: 'Configured servers are not verified as running.',
     });
     return 0;
@@ -302,6 +309,7 @@ export async function cmdInstall(
   if (o.scope !== undefined && !['user', 'project', 'local'].includes(o.scope)) throw new UsageError('--scope must be user, project or local');
   if (o.access !== undefined && o.access !== 'read' && o.access !== 'write') throw new UsageError('--access must be read or write');
   const plan = planInstall({
+    entries: s.registry.entries,
     entry,
     host,
     projectRoot: s.root,
@@ -371,7 +379,9 @@ export async function cmdTry(io: IO, o: { id: string; path?: string; host?: stri
   }
   const host = pickHost(s, o.host, entry);
   if (entry.kind !== 'mcp' || !entry.install) {
-    io.out(`${entry.name} is not an MCP server, so there is no one-off mode. Steps: stackhint explain ${entry.id}`);
+    const note = `${entry.name} is not an MCP server stackhint can start, so there is no one-off mode. Steps: stackhint explain ${entry.id}`;
+    if (format === 'json') json(io, { id: entry.id, host, command: null, note });
+    else io.out(note);
     return 0;
   }
   let r;

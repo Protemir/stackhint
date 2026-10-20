@@ -206,6 +206,8 @@ export interface ConfiguredServer {
   viaPlugin?: string;
   /** Claude Code project server that the user has not approved yet. */
   pendingApproval?: boolean;
+  /** Why a configured server is not active, when the host says so (e.g. an untrusted Codex project). */
+  inactiveReason?: string;
   /** Header and env keys whose values look like literal secrets (values are never kept). */
   inlineSecrets: string[];
   /** env.X / header.X -> value, with anything secret-looking replaced by ***. */

@@ -346,6 +346,8 @@ export const PYPI: PackageRule[] = [
 ];
 
 export const GO: PackageRule[] = [
+  ['github.com/mattn/go-sqlite3', [['db:sqlite', 0.8]]],
+  ['modernc.org/sqlite', [['db:sqlite', 0.8]]],
   ['github.com/DataDog/dd-trace-go*', [['obs:datadog', 0.85]]],
   ['gopkg.in/DataDog/dd-trace-go*', [['obs:datadog', 0.85]]],
   ['github.com/newrelic/go-agent*', [['obs:newrelic', 0.85]]],
@@ -456,6 +458,8 @@ export const COMPOSER: PackageRule[] = [
 ];
 
 export const GEMS: PackageRule[] = [
+  ['chewy', [['db:elasticsearch', 0.8]]],
+  ['prometheus_exporter', [['obs:prometheus', 0.7]]],
   ['datadog', [['obs:datadog', 0.85]]],
   ['ddtrace', [['obs:datadog', 0.85]]],
   ['newrelic_rpm', [['obs:newrelic', 0.85]]],

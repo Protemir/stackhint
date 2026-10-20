@@ -46,6 +46,8 @@ import { claudeAddArgv, claudeServerJson, codexServerTable, resolveSpec, SpecErr
 
 
 
+
+
 /** Read a config file for editing, or a reason why it must not be rewritten. */
 export function readConfigForEdit(file        , env      )                                                                          {
   if (!exists(file)) return { existed: false, text: '', bom: false, hash: sha256('') };
@@ -131,9 +133,13 @@ export function planInstall(req             )              {
   }
   if (hostInfo.support === 'unknown') plan.warnings.push(`Compatibility with ${hostLabel(host)} is not verified.`);
 
-  const avail = availabilityFor(entry, inventory, host);
+  const avail = availabilityFor(entry, inventory, host, req.entries);
   if (avail.state === 'configured' && !req.force) {
-    plan.blocked = `already set up for ${hostLabel(host)}: ${avail.detail}. Use --force to add another copy.`;
+    plan.blocked = entry.kind === 'cli' ? `already available: ${avail.detail}; nothing to install.` : `already set up for ${hostLabel(host)}: ${avail.detail}. Use --force to add another copy.`;
+    return plan;
+  }
+  if (avail.state === 'disabled' && !req.force) {
+    plan.blocked = `already in the ${hostLabel(host)} config but not active (${avail.detail}). Enable it there; --force adds another copy instead.`;
     return plan;
   }
 

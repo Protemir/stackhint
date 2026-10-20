@@ -32,6 +32,8 @@ export interface PlanRequest {
   now?: number;
   /** Spec built in code by stackhint itself (setup), not from a registry file. */
   trusted?: boolean;
+  /** All registry entries, so a configured server is attributed to the entry it really belongs to. */
+  entries?: RegistryEntry[];
 }
 
 export interface PlanTarget {
@@ -131,9 +133,13 @@ export function planInstall(req: PlanRequest): InstallPlan {
   }
   if (hostInfo.support === 'unknown') plan.warnings.push(`Compatibility with ${hostLabel(host)} is not verified.`);
 
-  const avail = availabilityFor(entry, inventory, host);
+  const avail = availabilityFor(entry, inventory, host, req.entries);
   if (avail.state === 'configured' && !req.force) {
-    plan.blocked = `already set up for ${hostLabel(host)}: ${avail.detail}. Use --force to add another copy.`;
+    plan.blocked = entry.kind === 'cli' ? `already available: ${avail.detail}; nothing to install.` : `already set up for ${hostLabel(host)}: ${avail.detail}. Use --force to add another copy.`;
+    return plan;
+  }
+  if (avail.state === 'disabled' && !req.force) {
+    plan.blocked = `already in the ${hostLabel(host)} config but not active (${avail.detail}). Enable it there; --force adds another copy instead.`;
     return plan;
   }
 

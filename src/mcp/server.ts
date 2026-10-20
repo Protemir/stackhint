@@ -164,7 +164,7 @@ export async function callTool(name: string, args: Json, deps: ServerDeps = {}):
     case 'tooling_status': {
       const s = await openSession({ ...common, skipScan: true });
       const findings = checkConfig(s.registry, s.inventory, s.hosts);
-      return { text: `${renderStatus(md, s.inventory, s.hosts, s.root)}\n\n${renderFindings(md, findings)}`, structured: { findings: findings as unknown as Json[] } as Json };
+      return { text: `${DATA_NOTE}\n\n${renderStatus(md, s.inventory, s.hosts, s.root)}\n\n${renderFindings(md, findings)}`, structured: { findings: findings as unknown as Json[] } as Json };
     }
     case 'plan_install': {
       const id = str(args['id'], 100);
@@ -175,10 +175,12 @@ export async function callTool(name: string, args: Json, deps: ServerDeps = {}):
       if (!entry) return { text: `No registry entry "${sanitizeLine(id, 60)}".`, isError: true };
       const scope = args['scope'] === 'user' || args['scope'] === 'project' || args['scope'] === 'local' ? args['scope'] : undefined;
       const access = args['access'] === 'read' || args['access'] === 'write' ? args['access'] : undefined;
-      const plan = planInstall({ entry, host: h, projectRoot: s.root, inventory: s.inventory, env, platform: s.platform, ...(scope ? { scope } : {}), ...(access ? { access } : {}) });
+      const plan = planInstall({ entry, entries: s.registry.entries, host: h, projectRoot: s.root, inventory: s.inventory, env, platform: s.platform, ...(scope ? { scope } : {}), ...(access ? { access } : {}) });
+      // A folder name that is unsafe to paste into a shell is left out: run it from the folder.
       const where = shellArg(s.root);
-      const cmd = `stackhint install ${entry.id} --host ${h}${scope ? ` --scope ${scope}` : ''}${access ? ` --access ${access}` : ''} ${where}`;
-      const tail = plan.blocked || plan.method === 'guided' ? '' : `\n\nNothing was changed. To install, the user runs this in a terminal and confirms:\n\n\`\`\`\n${cmd}\n\`\`\``;
+      const cmd = `stackhint install ${entry.id} --host ${h}${scope ? ` --scope ${scope}` : ''}${access ? ` --access ${access}` : ''}${where ? ` ${where}` : ''}`;
+      const howTo = where ? 'the user runs this in a terminal and confirms' : 'the user runs this in a terminal, in the project folder, and confirms';
+      const tail = plan.blocked || plan.method === 'guided' ? '' : `\n\nNothing was changed. To install, ${howTo}:\n\n\`\`\`\n${cmd}\n\`\`\``;
       return { text: `${DATA_NOTE}\n\n${renderPlan(md, plan)}${tail}` };
     }
     default:

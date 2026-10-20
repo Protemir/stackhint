@@ -6,7 +6,7 @@ import { hostLabel } from '../hosts/inventory.js';
 
 import { displayPath } from '../util/paths.js';
 import { redactArgs, redactString } from '../util/redact.js';
-import { colors, sanitize, sanitizeLine, shellArg,             } from '../util/text.js';
+import { cleanLines, colors, safeName, sanitize, sanitizeLine, shellArg,             } from '../util/text.js';
 
 
 
@@ -65,7 +65,7 @@ export function stackSummary(ctx                )         {
   return [...new Set(labels)].slice(0, 14).join(', ') || 'nothing specific';
 }
 
-function availabilityLine(a                          )         {
+function availabilityLine(a                          , s        )         {
   if (!a) return 'unknown';
   const map                                        = {
     configured: 'set up',
@@ -75,7 +75,9 @@ function availabilityLine(a                          )         {
     incompatible: 'not available',
     unknown: 'unknown',
   };
-  return a.detail && a.state !== 'not-configured' ? `${map[a.state]} (${a.detail})` : map[a.state];
+  // Details quote names from config files: escape them for the output they go to.
+  const detail = s ? t(s, a.detail, 300) : sanitizeLine(a.detail, 300);
+  return a.detail && a.state !== 'not-configured' ? `${map[a.state]} (${detail})` : map[a.state];
 }
 
 function list(s       , items          , indent = '  ')         {
@@ -111,7 +113,9 @@ export function renderRecommendations(
   opts                                                                          = {},
 )         {
   // When the project was given as a path, the printed commands must name it too.
-  const pathArg = opts.projectArg ? ` ${shellArg(opts.projectArg)}` : '';
+  // A folder name that is unsafe in some shell is left out (the commands then run from that folder).
+  const quoted = opts.projectArg ? shellArg(opts.projectArg) : undefined;
+  const pathArg = quoted ? ` ${quoted}` : '';
   const out           = [];
   out.push(heading(s, `stackhint: tools for ${sanitizeLine(displayPath(ctx.root), 120)}`, 2));
   out.push(`Detected: ${stackSummary(ctx)}${ctx.task ? ` | task: "${t(s, ctx.task.text, 120)}"` : ''}`);
@@ -133,7 +137,7 @@ export function renderRecommendations(
     }
     out.push(`${s.md ? '**Permissions:**' : 'Permissions:'} ${t(s, e.access.summary || e.access.level, 300)}`);
     out.push(`${s.md ? '**Setup:**' : 'Setup:'} ~${e.setup.minutes} min, ${e.setup.effort} effort; auth: ${t(s, e.auth.type)}${e.official ? '; official vendor tool' : '; community project'}`);
-    out.push(`${s.md ? '**Status:**' : 'Status:'} ${hosts.map((h) => `${hostLabel(h)}: ${availabilityLine(r.availability[h])}`).join(' | ')}`);
+    out.push(`${s.md ? '**Status:**' : 'Status:'} ${hosts.map((h) => `${hostLabel(h)}: ${availabilityLine(r.availability[h], s)}`).join(' | ')}`);
     if (r.uncertainty.length) out.push(`${s.md ? '**Uncertain:**' : 'Uncertain:'} ${t(s, r.uncertainty.join('; '), 400)}`);
     if (r.alternatives.length) out.push(`${s.md ? '**Alternatives:**' : 'Alternatives:'} ${r.alternatives.join(', ')}`);
     out.push(s.md ? '**Actions:**' : 'Actions:');
@@ -142,7 +146,7 @@ export function renderRecommendations(
   });
   if (opts.showAvailable !== false && available.length) {
     out.push(heading(s, 'Already set up or covered', 3));
-    out.push(list(s, available.slice(0, 8).map((r) => `${t(s, r.entry.name)}: ${hosts.map((h) => `${hostLabel(h)} ${availabilityLine(r.availability[h])}`).join('; ')}${r.whyNow.includes('already have') ? ` (${t(s, r.whyNow.slice(r.whyNow.indexOf('You already have')), 160)})` : ''}`)));
+    out.push(list(s, available.slice(0, 8).map((r) => `${t(s, r.entry.name)}: ${hosts.map((h) => `${hostLabel(h)} ${availabilityLine(r.availability[h], s)}`).join('; ')}${r.whyNow.includes('already have') ? ` (${t(s, r.whyNow.slice(r.whyNow.indexOf('You already have')), 160)})` : ''}`)));
     out.push('');
   }
   out.push(s.md ? '_Scores are heuristic (relevance, value, setup cost, risk), not measurements. Nothing is installed without your confirmation._' : s.c.dim('Scores are heuristic (relevance, value, setup cost, risk), not measurements. Nothing is installed without your confirmation.'));
@@ -154,7 +158,8 @@ export function renderScan(s       , ctx                )         {
   const out           = [];
   out.push(heading(s, `Project scan: ${sanitizeLine(displayPath(ctx.root), 120)}`));
   out.push(`${ctx.stats.filesSeen} files seen, ${ctx.stats.filesRead} read, ${ctx.stats.elapsedMs} ms${ctx.stats.truncated ? ', stopped early' : ''}`);
-  if (ctx.git.isRepo) out.push(`git: ${ctx.git.branch ?? '(detached)'}; remotes: ${ctx.git.remotes.map((r) => `${r.name} ${r.host}`).join(', ') || 'none'}`);
+  // Branch and remote names come from the repository: no escapes or bidi tricks in the terminal.
+  if (ctx.git.isRepo) out.push(`git: ${ctx.git.branch ? t(s, safeName(ctx.git.branch, 80)) : '(detached)'}; remotes: ${ctx.git.remotes.map((r) => t(s, safeName(`${r.name} ${r.host}`, 80))).join(', ') || 'none'}`);
   out.push('');
   const signals = Object.values(ctx.signals).sort((a, b) => b.strength - a.strength || a.id.localeCompare(b.id));
   for (const sig of signals) {
@@ -212,7 +217,7 @@ export function renderExplain(s       , r                            , e        
     out.push(heading(s, hostLabel(h), 3));
     const info = e.hosts[h];
     const lines           = [`Support: ${info.support}${info.notes ? ` (${t(s, info.notes)})` : ''}`];
-    if (r?.availability[h]) lines.push(`Here: ${availabilityLine(r.availability[h])}`);
+    if (r?.availability[h]) lines.push(`Here: ${availabilityLine(r.availability[h], s)}`);
     if (e.kind === 'mcp' && e.install && info.support !== 'no') lines.push(`Install: ${code(s, `stackhint install ${e.id} --host ${h}`)} (dry run first: add --dry-run)`);
     if (info.plugin) lines.push(`Official plugin: ${code(s, h === 'claude' ? `/plugin install ${info.plugin}` : `codex plugin add ${info.plugin}`)}`);
     if (info.officialCommand) lines.push(`Vendor's own command: ${code(s, info.officialCommand)}`);
@@ -251,12 +256,17 @@ export function renderPlan(s       , p             )         {
   if (p.method === 'cli' && p.argv) {
     out.push('');
     out.push('Command:');
-    out.push(s.md ? '```\n' + redactString(`claude ${redactArgs(p.argv).join(' ')}`) + '\n```' : '  ' + s.c.cyan(redactString(p.command ?? '')));
+    // Quoted like the text output: copied unquoted into a shell, ${TOKEN} would expand and the
+    // real secret would be written into ~/.claude.json.
+    out.push(s.md ? '```\n' + redactString(p.command ?? '') + '\n```' : '  ' + s.c.cyan(redactString(p.command ?? '')));
   }
   if (p.diff) {
     out.push('');
     out.push(`Change to ${displayPath(p.target?.path ?? '')}${p.target?.existed ? '' : ' (new file)'}:`);
-    out.push(s.md ? '```diff\n' + p.diff + '\n```' : p.diff.split('\n').map((l) => (l.startsWith('+') ? s.c.green(l) : l.startsWith('-') ? s.c.red(l) : s.c.dim(l))).map((l) => '  ' + l).join('\n'));
+    // Config files can hold anything: no escapes, no bidi tricks, and a fence the content cannot close.
+    const diff = cleanLines(p.diff);
+    const fence = '`'.repeat(Math.max(3, ...[...diff.matchAll(/`+/g)].map((m) => m[0].length + 1)));
+    out.push(s.md ? `${fence}diff\n${diff}\n${fence}` : diff.split('\n').map((l) => (l.startsWith('+') ? s.c.green(l) : l.startsWith('-') ? s.c.red(l) : s.c.dim(l))).map((l) => '  ' + l).join('\n'));
   }
   if (p.envNeeded.length) {
     out.push('');
@@ -315,14 +325,14 @@ export function renderStatus(s       , inv           , hosts          , root    
     out.push(`MCP servers (configured, not verified as running): ${servers.length ? '' : 'none'}`);
     for (const x of servers) {
       const what = x.url ? redactString(x.url) : redactArgs([x.command ?? '', ...x.args]).join(' ');
-      out.push(`  - ${x.name} [${x.viaPlugin ? `plugin ${x.viaPlugin}` : x.scope}${x.enabled ? '' : ', disabled'}${x.pendingApproval ? ', not approved yet' : ''}] ${x.transport}: ${sanitizeLine(what, 140)}`);
+      out.push(`  - ${t(s, safeName(x.name, 40))} [${x.viaPlugin ? `plugin ${t(s, safeName(x.viaPlugin, 60))}` : x.scope}${x.enabled ? '' : ', disabled'}${x.pendingApproval ? ', not approved yet' : ''}] ${x.transport}: ${t(s, sanitizeLine(what, 140))}`);
     }
     const plugins = inv.plugins.filter((x) => x.host === h);
-    if (plugins.length) out.push(`Plugins: ${plugins.map((p) => `${p.id}${p.enabled ? '' : ' (disabled)'}`).join(', ')}`);
+    if (plugins.length) out.push(`Plugins: ${plugins.map((p) => `${t(s, safeName(p.id, 60))}${p.enabled ? '' : ' (disabled)'}`).join(', ')}`);
     const skills = inv.skills.filter((x) => x.host === h);
-    if (skills.length) out.push(`Skills/commands: ${skills.map((k) => `${k.name} (${k.scope})`).slice(0, 20).join(', ')}${skills.length > 20 ? ', …' : ''}`);
+    if (skills.length) out.push(`Skills/commands: ${skills.map((k) => `${t(s, safeName(k.name, 40))} (${k.scope})`).slice(0, 20).join(', ')}${skills.length > 20 ? ', …' : ''}`);
     for (const f of inv.files.filter((x) => x.host === h)) {
-      if (f.error) out.push(s.c.red(`  ! ${f.kind}: ${f.error} (${displayPath(f.path)})`));
+      if (f.error) out.push(s.c.red(`  ! ${f.kind}: ${t(s, sanitizeLine(f.error, 200))} (${t(s, displayPath(f.path))})`));
     }
   }
   const exes = Object.keys(inv.executables).filter((x) => x !== 'claude' && x !== 'codex');
@@ -353,7 +363,8 @@ export function recommendationJson(r                )                          {
     score: r.score,
     confidence: r.confidence,
     whyNow: r.whyNow,
-    reasons: r.reasons.map((x) => ({ signal: x.signal, strength: x.strength, weight: x.weight, evidence: x.evidence.slice(0, 3) })),
+    // Evidence quotes the project's file names; agents read this JSON through the MCP server.
+    reasons: r.reasons.map((x) => ({ signal: x.signal, strength: x.strength, weight: x.weight, evidence: x.evidence.slice(0, 3).map((e) => ({ source: safeName(e.source, 120), detail: sanitizeLine(e.detail, 200).replace(/</g, '‹').replace(/>/g, '›') })) })),
     breakdown: r.breakdown,
     availability: Object.fromEntries(Object.entries(r.availability).map(([h, a]) => [h, { state: a?.state, detail: a?.detail }])),
     uncertainty: r.uncertainty,

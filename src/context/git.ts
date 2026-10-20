@@ -4,6 +4,14 @@ import type { GitInfo, GitRemote } from '../types.ts';
 import { readText } from '../util/fsx.ts';
 import { which, run } from '../util/exec.ts';
 
+/**
+ * Two leading slashes of any kind mean a network share on Windows. A repository must never send
+ * us (or git) there: just opening \\host\share leaks the user's NTLM hash to that host.
+ */
+export function isNetworkPath(p: string): boolean {
+  return /^[\\/]{2}/.test(p.trim());
+}
+
 /** Find the .git directory (or worktree gitdir file) for a project. */
 export function findGitDir(root: string): string | undefined {
   let dir = path.resolve(root);
@@ -15,7 +23,11 @@ export function findGitDir(root: string): string | undefined {
       if (st.isFile()) {
         const text = readText(candidate, 4096) ?? '';
         const m = /^gitdir:\s*(.+)$/m.exec(text);
-        if (m && m[1]) return path.resolve(dir, m[1].trim());
+        if (m && m[1]) {
+          const target = m[1].trim();
+          const resolved = path.resolve(dir, target);
+          return isNetworkPath(target) || isNetworkPath(resolved) ? undefined : resolved;
+        }
       }
     } catch {
       /* keep walking up */
@@ -116,24 +128,41 @@ export async function readGit(root: string, opts: GitOptions): Promise<GitInfo> 
   // Worktrees keep shared refs and config in the common dir.
   let commonDir = gitDir;
   const common = readText(path.join(gitDir, 'commondir'), 4096);
+  if (common && isNetworkPath(common)) return { ...info, isRepo: false };
   if (common) commonDir = path.resolve(gitDir, common.trim());
+  if (isNetworkPath(commonDir)) return { ...info, isRepo: false };
 
   const head = readText(path.join(gitDir, 'HEAD'), 4096) ?? '';
   const m = /^ref:\s*refs\/heads\/(.+)$/m.exec(head);
   if (m && m[1]) info.branch = m[1].trim();
 
-  info.remotes = parseRemotes(readText(path.join(commonDir, 'config'), 1024 * 1024) ?? '');
+  const configText = readText(path.join(commonDir, 'config'), 1024 * 1024) ?? '';
+  info.remotes = parseRemotes(configText);
   info.branches = listBranches(gitDir, commonDir);
 
-  if (opts.history) {
+  // git would follow config includes and object alternates wherever they point, network shares
+  // included: such repositories get no history rather than a connection to someone's server.
+  const alternates = readText(path.join(commonDir, 'objects', 'info', 'alternates'), 64 * 1024) ?? '';
+  const risky = /\[\s*include/i.test(configText) || alternates.trim() !== '' || fs.existsSync(path.join(gitDir, 'config.worktree')) || fs.existsSync(path.join(commonDir, 'config.worktree'));
+  if (opts.history && !risky) {
     const git = which('git');
     if (git) {
       // The scanned repository's .git/config is untrusted: switch off everything in it that could
-      // run a program (signature checks via gpg.program, fsmonitor hooks, pagers, textconv).
+      // run a program (signature checks via gpg.program, fsmonitor hooks, pagers, textconv), and
+      // forbid any fetch: in a partial clone `git log` would otherwise fetch a missing commit
+      // lazily and run the repository's core.sshCommand. Per-protocol settings beat
+      // protocol.allow, so each one is set; GIT_ALLOW_PROTOCOL and GIT_NO_LAZY_FETCH back it up.
+      // safe.bareRepository=explicit: a bare repository planted in a subfolder is not used. (No
+      // --git-dir: passing it would skip git's safe.directory ownership check.)
+      const noFetch = ['ssh', 'git', 'http', 'https', 'file', 'ext'].flatMap((p) => ['-c', `protocol.${p}.allow=never`]);
       const res = await run(
         git,
         [
           '--no-pager',
+          '-c', 'safe.bareRepository=explicit',
+          '-c', 'protocol.allow=never',
+          ...noFetch,
+          '-c', 'core.sshCommand=false',
           '-c', 'core.quotepath=off',
           '-c', 'log.showSignature=false',
           '-c', 'core.fsmonitor=false',
@@ -142,12 +171,23 @@ export async function readGit(root: string, opts: GitOptions): Promise<GitInfo> 
           '-c', 'gpg.ssh.program=false',
           '-c', 'gpg.x509.program=false',
           '-c', 'diff.external=',
-          'log', '-n', '200', '--no-merges', '--no-show-signature', '--no-textconv', '--no-ext-diff', '--no-color', '--format=%s',
+          'log', '--no-mailmap', '-n', '200', '--no-merges', '--no-show-signature', '--no-textconv', '--no-ext-diff', '--no-color', '--format=%s',
         ],
         {
           cwd: root,
           timeoutMs: 2500,
-          env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', GIT_PAGER: 'cat', PAGER: 'cat', GIT_CONFIG_NOSYSTEM: '1' },
+          env: {
+            ...process.env,
+            GIT_TERMINAL_PROMPT: '0',
+            GIT_OPTIONAL_LOCKS: '0',
+            GIT_PAGER: 'cat',
+            PAGER: 'cat',
+            GIT_CONFIG_NOSYSTEM: '1',
+            GIT_NO_LAZY_FETCH: '1',
+            // Only this made-up protocol is allowed, so none of the real ones are.
+            GIT_ALLOW_PROTOCOL: 'stackhint-none',
+            GIT_SSH_COMMAND: 'false',
+          },
         },
       );
       if (res.code === 0) {

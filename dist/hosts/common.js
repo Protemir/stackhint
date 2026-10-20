@@ -118,6 +118,9 @@ export function newestSubdir(dir        )                     {
 }
 
 /** Skills are folders containing SKILL.md. Name comes from frontmatter when present. */
+/** A repository can hold any number of skill folders; reading 40 000 of them would stall the hooks. */
+const MAX_SKILLS = 300;
+
 export function listSkills(host        , dir        , scope           )                   {
   const out                   = [];
   let entries             ;
@@ -126,7 +129,7 @@ export function listSkills(host        , dir        , scope           )         
   } catch {
     return out;
   }
-  for (const e of entries) {
+  for (const e of entries.slice(0, MAX_SKILLS)) {
     if (!e.isDirectory() && !e.isSymbolicLink()) continue;
     const file = path.join(dir, e.name, 'SKILL.md');
     const text = readText(file, 256 * 1024);
@@ -142,7 +145,7 @@ export function listSkills(host        , dir        , scope           )         
 export function listCommands(host        , dir        , scope           )                   {
   const out                   = [];
   try {
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true }).slice(0, MAX_SKILLS)) {
       if (e.isFile() && e.name.endsWith('.md')) out.push({ host, name: e.name.slice(0, -3), scope, source: path.join(dir, e.name) });
     }
   } catch {

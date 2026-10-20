@@ -4,6 +4,7 @@ import path from 'node:path';
 import { readText } from '../util/fsx.js';
 import { relPath } from '../util/paths.js';
 import { redactString } from '../util/redact.js';
+import { safeName } from '../util/text.js';
 import { readGit } from './git.js';
 import { CARGO, COMPOSER, GEMS, GO, IMAGES, MAVEN, NPM, NUGET, PYPI, matchPackage,                  } from './packages.js';
 import { SignalSet } from './signals.js';
@@ -151,7 +152,8 @@ export async function analyzeProject(rootInput        , opts                 = {
     const lines = t.split('\n');
     return lines.some((l) => l.length > 2000) ? lines.map((l) => (l.length > 2000 ? l.slice(0, 2000) : l)).join('\n') : t;
   };
-  const ev = (f          , detail        ) => ({ source: f.rel, detail });
+  // A file name used as the detail is the project's text: shown as a name (see safeName).
+  const ev = (f          , detail        ) => ({ source: f.rel, detail: detail === f.name ? safeName(detail, 60) : detail });
 
   // ---- language by extension (sample and fixture folders do not count) ----
   const extCount = new Map                ();
@@ -177,16 +179,24 @@ export async function analyzeProject(rootInput        , opts                 = {
     ['lang:lua', ['.lua']],
     ['lang:liquid', ['.liquid']],
   ];
+  const langCount = (exts          )         => exts.reduce((acc, e) => acc + (extCount.get(e) ?? 0), 0);
+  const codeTotal = LANGS.reduce((acc, [, exts]) => acc + langCount(exts), 0);
   for (const [id, exts] of LANGS) {
-    const n = exts.reduce((acc, e) => acc + (extCount.get(e) ?? 0), 0);
+    const n = langCount(exts);
     if (n === 0) continue;
-    const strength = n >= 20 ? 0.95 : n >= 5 ? 0.8 : 0.5;
+    // One stray file (a Homebrew formula, an editor config in Lua) is not the project's language.
+    let strength = n >= 100 ? 0.95 : n >= 20 ? 0.85 : n >= 5 ? 0.7 : n >= 2 ? 0.45 : 0.3;
+    // A handful of files next to a large codebase in another language is a side script.
+    if (n < 50 && n / Math.max(1, codeTotal) < 0.05) strength = Math.min(strength, 0.45);
     set.atLeast(id, strength, { source: '.', detail: `${n} ${exts.join('/')} file${n === 1 ? '' : 's'}` });
   }
+  /** Whether the project has source files with these extensions (outside example folders). */
+  const hasCode = (...exts          )          => langCount(exts) > 0;
   const uiFiles = ['.tsx', '.jsx', '.vue', '.svelte'].reduce((acc, e) => acc + (extCount.get(e) ?? 0), 0);
   if (uiFiles >= 5) set.add('tech:frontend', 0.7, { source: '.', detail: `${uiFiles} UI component files` });
   // Plain static sites: HTML pages with CSS or scripts.
-  const htmlFiles = (extCount.get('.html') ?? 0) + (extCount.get('.htm') ?? 0);
+  const templates = files.filter((x) => /\.component\.html$/.test(x.lower) && !isSampleDir(x.rel)).length;
+  const htmlFiles = (extCount.get('.html') ?? 0) + (extCount.get('.htm') ?? 0) - templates;
   const styleOrScript = ['.css', '.scss', '.js', '.mjs'].reduce((acc, e) => acc + (extCount.get(e) ?? 0), 0);
   if (htmlFiles >= 3 && styleOrScript >= 1) set.add('tech:frontend', 0.6, { source: '.', detail: `${htmlFiles} HTML pages` });
   // Component files of frameworks that have their own MCP servers.
@@ -199,7 +209,7 @@ export async function analyzeProject(rootInput        , opts                 = {
 
   const applyPackages = (target            , f          , rules               , names                  , kind        )       => {
     for (const name of names) {
-      for (const [id, strength] of matchPackage(rules, name)) target.add(id, strength, ev(f, `${kind} ${name}`));
+      for (const [id, strength] of matchPackage(rules, name)) target.add(id, strength, ev(f, `${kind} ${safeName(name, 60)}`));
     }
   };
   // Sample/fixture folders collect into their own set; it is merged with a hard cap below.
@@ -268,7 +278,8 @@ export async function analyzeProject(rootInput        , opts                 = {
     if (n === 'package.json') {
       const t = read(f);
       if (!t) continue;
-      target.add('tech:node', 0.9, ev(f, 'package.json'));
+      if (hasCode('.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.mts', '.cts')) target.add('tech:node', 0.9, ev(f, 'package.json'));
+      else target.atLeast('tech:node', 0.5, ev(f, 'package.json (tooling only, no JavaScript files)'));
       try {
         const pkg = JSON.parse(t)                           ;
         const names = new Set        ();
@@ -331,13 +342,15 @@ export async function analyzeProject(rootInput        , opts                 = {
 
     // Python
     if (/^requirements[\w.-]*\.txt$/.test(n) || n === 'constraints.txt' || (f.ext === '.txt' && /(^|\/)requirements\/[^/]+$/.test(relLower))) {
-      target.add('lang:python', 0.85, ev(f, f.name));
+      if (hasCode('.py', '.pyi')) target.add('lang:python', 0.85, ev(f, f.name));
+      else target.atLeast('lang:python', 0.3, ev(f, safeName(f.name, 60) + ' (no Python files)'));
       const t = read(f);
       if (t) applyPackages(target, f, PYPI, pythonRequirements(t), 'requirement');
       continue;
     }
     if (n === 'pyproject.toml' || n === 'pipfile' || n === 'setup.py' || n === 'setup.cfg' || n === 'environment.yml') {
-      target.add('lang:python', 0.85, ev(f, f.name));
+      if (hasCode('.py', '.pyi')) target.add('lang:python', 0.85, ev(f, f.name));
+      else target.atLeast('lang:python', 0.3, ev(f, safeName(f.name, 60) + ' (no Python files)'));
       const t = read(f);
       if (t) applyPackages(target, f, PYPI, pythonManifestNames(t, f.name), 'dependency');
       continue;
@@ -363,13 +376,14 @@ export async function analyzeProject(rootInput        , opts                 = {
     }
     if (n === 'pom.xml' || n === 'build.gradle' || n === 'build.gradle.kts' || n === 'libs.versions.toml') {
       // The Kotlin DSL is common in Java projects too: the source files decide the language.
-      if (n === 'pom.xml' || n === 'build.gradle') target.add('lang:java', 0.85, ev(f, f.name));
+      if ((n === 'pom.xml' || n === 'build.gradle') && hasCode('.java')) target.add('lang:java', 0.85, ev(f, f.name));
       const t = read(f);
       if (t) applyPackages(target, f, MAVEN, jvmCoordinates(t), 'artifact');
       continue;
     }
     if (n === 'composer.json') {
-      target.add('lang:php', 0.9, ev(f, 'composer.json'));
+      if (hasCode('.php')) target.add('lang:php', 0.9, ev(f, 'composer.json'));
+      else target.atLeast('lang:php', 0.3, ev(f, 'composer.json (no PHP files)'));
       const t = read(f);
       if (t) {
         try {
@@ -383,7 +397,8 @@ export async function analyzeProject(rootInput        , opts                 = {
       continue;
     }
     if (n === 'gemfile') {
-      target.add('lang:ruby', 0.9, ev(f, 'Gemfile'));
+      if (hasCode('.rb', '.rake')) target.add('lang:ruby', 0.9, ev(f, 'Gemfile'));
+      else target.atLeast('lang:ruby', 0.3, ev(f, 'Gemfile (no Ruby files)'));
       const t = read(f);
       if (t) applyPackages(target, f, GEMS, [...t.matchAll(/^[ \t]*gem[ \t]+['"]([^'"\n]{1,100})['"]/gm)].map((m) => m[1]          ), 'gem');
       continue;
@@ -407,7 +422,7 @@ export async function analyzeProject(rootInput        , opts                 = {
           const image = (m[1]          ).toLowerCase().replace(/^\$\{[a-z0-9_]{1,80}:?-([^}]{1,150})\}$/, '$1');
           const bare = image.replace(/[:@].*$/, '');
           for (const [re, sigs] of IMAGES) {
-            if (re.test(bare)) for (const [id, s] of sigs) target.add(id, s, ev(f, `service image ${image}`));
+            if (re.test(bare)) for (const [id, s] of sigs) target.add(id, s, ev(f, `service image ${safeName(image, 80)}`));
           }
         }
       }
@@ -570,7 +585,7 @@ export async function analyzeProject(rootInput        , opts                 = {
     }
 
     // Env examples: key names and URL schemes only, never values.
-    if (/^\.env\.(example|sample|template|dist|defaults)$/.test(n) || n === 'env.example' || n === 'example.env') {
+    if (/^\.env(\.[\w-]{1,30})?\.(example|sample|template|dist|defaults)$/.test(n) || n === 'env.example' || n === 'example.env') {
       const t = read(f, 64 * 1024);
       if (t) detectEnvExample(f, t, target);
       continue;
@@ -672,7 +687,9 @@ export async function analyzeProject(rootInput        , opts                 = {
 /** Examples, samples and test fixtures describe other projects, not this one. */
 export function isSampleDir(rel        )          {
   const dir = rel.replace(/\\/g, '/').split('/').slice(0, -1).join('/');
-  return /(^|\/)(examples?|samples?|fixtures?|__fixtures__|testdata|test-data|demos?)(\/|$)/i.test(dir);
+  // Exact folder names only, plus "example-apps"-style containers: "sample-tracker" or
+  // "demo-data-loader" can be the product itself.
+  return /(^|\/)(examples?|samples?|demos?|fixtures?|__fixtures__|testdata|test-data|playgrounds?|(examples?|samples?|demos?)[-_](apps?|projects?))(\/|$)/i.test(dir);
 }
 
 function bump(map                     , key        )       {
@@ -783,9 +800,17 @@ export function pythonManifestNames(rawText        , fileName = 'pyproject.toml'
     const key = kv[1].replace(/"/g, '');
     let value = kv[2] ?? '';
     // Collect a multi-line array value.
-    if (value.trimStart().startsWith('[') && !balanced(value)) {
-      // Drop comments on continuation lines: an apostrophe in "# don't pin" would open a quote.
-      while (i + 1 < lines.length && !balanced(value)) value += '\n' + stripTomlComment(lines[++i]          );
+    if (value.trimStart().startsWith('[')) {
+      // Track brackets incrementally (re-scanning the growing value made this quadratic on a
+      // file with thousands of blank lines) and stop after 64 KB or 2000 lines.
+      const brackets = bracketTracker();
+      brackets.feed(value);
+      for (let n = 0; i + 1 < lines.length && !brackets.closed() && value.length < 65_536 && n < 2000; n++) {
+        // Drop comments on continuation lines: an apostrophe in "# don't pin" would open a quote.
+        const next = '\n' + stripTomlComment(lines[++i]          );
+        value += next;
+        brackets.feed(next);
+      }
     }
     if (section === 'project' && (key === 'dependencies' || key === 'optional-dependencies')) {
       for (const r of quotedRequirements(value)) out.add(r);
@@ -817,19 +842,24 @@ function stripTomlComment(line        )         {
   return line;
 }
 
-function balanced(s        )          {
+/** Bracket depth of a TOML array value fed piece by piece; quotes hide brackets. */
+function bracketTracker()                                               {
   let depth = 0;
   let quote = '';
-  for (const c of s) {
-    if (quote) {
-      if (c === quote) quote = '';
-      continue;
-    }
-    if (c === '"' || c === "'") quote = c;
-    else if (c === '[') depth++;
-    else if (c === ']') depth--;
-  }
-  return depth <= 0;
+  return {
+    feed(s        )       {
+      for (const c of s) {
+        if (quote) {
+          if (c === quote) quote = '';
+          continue;
+        }
+        if (c === '"' || c === "'") quote = c;
+        else if (c === '[') depth++;
+        else if (c === ']') depth--;
+      }
+    },
+    closed: () => depth <= 0,
+  };
 }
 
 function normalizePy(name        )         {
@@ -898,7 +928,7 @@ function detectAppSettings(f          , text        , set            )       {
     for (const [name, value] of Object.entries(cs                           )) {
       if (typeof value !== 'string') continue;
       const kind = classifyConnectionString(value);
-      if (kind) set.add(kind.signal, 0.75, { source: f.rel, detail: `ConnectionStrings:${name} looks like ${kind.label}` });
+      if (kind) set.add(kind.signal, 0.75, { source: f.rel, detail: `ConnectionStrings:${safeName(name, 40)} looks like ${kind.label}` });
     }
   }
   for (const key of Object.keys(obj)) {
@@ -1069,7 +1099,7 @@ function detectEnvExample(f          , text        , set            )       {
     [/^AWS_/, 'cloud:aws', 0.55],
     [/^(AZURE_|ARM_)/, 'cloud:azure', 0.55],
     [/^(GOOGLE_CLOUD_|GCP_|GCLOUD_)/, 'cloud:gcp', 0.55],
-    [/^CLOUDFLARE_|^CF_API_TOKEN/, 'cloud:cloudflare', 0.6],
+    [/^CLOUDFLARE_(?!TURNSTILE)|^CF_API_TOKEN/, 'cloud:cloudflare', 0.6],
     [/^VERCEL_/, 'cloud:vercel', 0.5],
     [/^(NEXT_PUBLIC_)?FIREBASE_/, 'db:firebase', 0.7],
     [/^FIGMA_/, 'design:figma', 0.6],
@@ -1112,17 +1142,23 @@ function detectEnvExample(f          , text        , set            )       {
     if (!m || !m[1]) continue;
     const key = m[1].toUpperCase();
     const value = (m[2] ?? '').trim().replace(/^["']|["']$/g, '');
-    for (const [re, id, s] of KEYS) if (re.test(key)) set.add(id, s, { source: f.rel, detail: `env key ${key}` });
+    for (const [re, id, s] of KEYS) if (re.test(key)) set.add(id, s, { source: f.rel, detail: `env key ${safeName(key, 40)}` });
+    if (key === 'DB_CONNECTION') {
+      const DRIVERS                         = { mysql: 'db:mysql', mariadb: 'db:mysql', pgsql: 'db:postgres', postgres: 'db:postgres', postgresql: 'db:postgres', sqlite: 'db:sqlite', sqlsrv: 'db:sqlserver' };
+      const id = DRIVERS[value.toLowerCase()];
+      // Laravel 11+ ships DB_CONNECTION=sqlite as the default: weaker than a deliberate choice.
+      if (id) set.add(id, id === 'db:sqlite' ? 0.5 : 0.7, { source: f.rel, detail: 'DB_CONNECTION=' + value.toLowerCase() });
+    }
     if (/^(DATABASE_URL|DB_URL|DATABASE_URI|DB_CONNECTION)$/.test(key) || /_URL$|_URI$|CONNECTION/.test(key)) {
       const kind = classifyConnectionString(value);
-      if (kind) set.add(kind.signal, 0.7, { source: f.rel, detail: `${key} uses a ${kind.label} URL` });
-      if (/^prisma\+postgres:\/\//i.test(value)) set.add('db:prisma-postgres', 0.85, { source: f.rel, detail: `${key} uses Prisma Postgres` });
+      if (kind) set.add(kind.signal, 0.7, { source: f.rel, detail: `${safeName(key, 40)} uses a ${kind.label} URL` });
+      if (/^prisma\+postgres:\/\//i.test(value)) set.add('db:prisma-postgres', 0.85, { source: f.rel, detail: `${safeName(key, 40)} uses Prisma Postgres` });
     }
     // Host suffixes only; the value itself is never stored.
-    if (/\.supabase\.co\b/i.test(value)) set.add('db:supabase', 0.85, { source: f.rel, detail: `${key} points at Supabase` });
-    if (/\bneon\.tech\b/i.test(value)) set.add('db:neon', 0.85, { source: f.rel, detail: `${key} points at Neon` });
-    if (/\bclickhouse\.cloud\b/i.test(value)) set.add('db:clickhouse-cloud', 0.85, { source: f.rel, detail: `${key} points at ClickHouse Cloud` });
-    if (/\batlassian\.net\b/i.test(value)) set.add('tracker:jira', 0.75, { source: f.rel, detail: `${key} points at Atlassian Cloud` });
+    if (/\.supabase\.co\b/i.test(value)) set.add('db:supabase', 0.85, { source: f.rel, detail: `${safeName(key, 40)} points at Supabase` });
+    if (/\bneon\.tech\b/i.test(value)) set.add('db:neon', 0.85, { source: f.rel, detail: `${safeName(key, 40)} points at Neon` });
+    if (/\bclickhouse\.cloud\b/i.test(value)) set.add('db:clickhouse-cloud', 0.85, { source: f.rel, detail: `${safeName(key, 40)} points at ClickHouse Cloud` });
+    if (/\batlassian\.net\b/i.test(value)) set.add('tracker:jira', 0.75, { source: f.rel, detail: `${safeName(key, 40)} points at Atlassian Cloud` });
     const HOSTS                                          = [
       [/\bdatadoghq\.(com|eu)\b/i, 'obs:datadog', 0.8, 'Datadog'],
       [/\bhoneycomb\.io\b/i, 'obs:honeycomb', 0.85, 'Honeycomb'],
@@ -1171,11 +1207,11 @@ function detectCiContent(f          , text        , set            )       {
   add(/\bhelm (upgrade|install)\b|azure\/setup-helm/, 'infra:helm', 0.6, 'CI uses Helm');
   add(/hashicorp\/setup-terraform|\bterraform (plan|apply)\b/, 'infra:terraform', 0.6, 'CI runs Terraform');
   add(/aws-actions\/configure-aws-credentials|\baws (s3|ecs|lambda|cloudformation|ecr)\b/, 'cloud:aws', 0.6, 'CI talks to AWS');
-  add(/azure\/login|AzureCLI@|AzureWebApp@|\baz (webapp|aks|acr|login)\b/, 'cloud:azure', 0.6, 'CI talks to Azure');
+  add(/azure\/login|AzureCLI@|AzureWebApp@|\baz (webapp|aks|acr|login)\b/, 'cloud:azure', 0.45, 'CI talks to Azure');
   add(/google-github-actions\/auth|\bgcloud (run|builds|container)\b/, 'cloud:gcp', 0.6, 'CI talks to Google Cloud');
   add(/cloudflare\/wrangler-action|\bwrangler deploy\b/, 'cloud:cloudflare', 0.7, 'CI deploys to Cloudflare');
   add(/sonarsource\/|SonarCloud|sonarqube|SonarQubePrepare@/i, 'quality:sonar', 0.8, 'CI runs Sonar');
-  add(/semgrep/i, 'quality:semgrep', 0.75, 'CI runs Semgrep');
+  add(/(?<![\w-])semgrep\b/i, 'quality:semgrep', 0.75, 'CI runs Semgrep');
   add(/snyk\//i, 'quality:snyk', 0.75, 'CI runs Snyk');
   add(/\bdotnet (test|build|publish)\b|actions\/setup-dotnet|UseDotNet@/, 'tech:dotnet', 0.6, 'CI builds .NET');
   add(/getsentry\/action-release|sentry-cli/, 'obs:sentry', 0.7, 'CI creates Sentry releases');
@@ -1245,7 +1281,7 @@ function detectOtherClientConfigs(root        , set           )       {
         .filter(Boolean)
         .join(' ')
         .toLowerCase();
-      set.add('team-mcp:' + fingerprintKey(fingerprint), 0.8, { source: rel, detail: `team configured MCP server "${name.slice(0, 60)}" for another client` });
+      set.add('team-mcp:' + fingerprintKey(fingerprint), 0.8, { source: rel, detail: `team configured MCP server "${safeName(name, 40)}" for another client` });
     }
   }
 }
@@ -1260,7 +1296,8 @@ function fingerprintToken(raw        )         {
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t)) {
     try {
       const u = new URL(t);
-      return /^https?:$/.test(u.protocol) ? `${u.host}${u.pathname}` : '';
+      // Scheme, host and path: enough for URL patterns, without user info or query strings.
+      return /^https?:$/.test(u.protocol) ? `${u.protocol}//${u.host}${u.pathname}` : '';
     } catch {
       return '';
     }
@@ -1291,11 +1328,11 @@ export function detectGit(git         , set           )       {
   for (const r of git.remotes) {
     // SSH config aliases for several accounts: git@github.com-work:org/repo.git
     const h = r.host.replace(/^(github\.com|gitlab\.com|bitbucket\.org)[-_][\w.-]{1,60}$/, '$1');
-    if (h === 'github.com' || h.endsWith('.ghe.com')) set.add('vcs:github', 0.95, { source: 'git', detail: `remote ${r.name} on ${h}` });
-    else if (h === 'gitlab.com' || h.includes('gitlab')) set.add('vcs:gitlab', 0.9, { source: 'git', detail: `remote ${r.name} on ${h}` });
+    if (h === 'github.com' || h.endsWith('.ghe.com')) set.add('vcs:github', 0.95, { source: 'git', detail: `remote ${safeName(r.name, 40)} on ${safeName(h, 80)}` });
+    else if (h === 'gitlab.com' || h.includes('gitlab')) set.add('vcs:gitlab', 0.9, { source: 'git', detail: `remote ${safeName(r.name, 40)} on ${safeName(h, 80)}` });
     else if (h === 'dev.azure.com' || h.endsWith('.visualstudio.com') || h === 'ssh.dev.azure.com') {
-      set.add('vcs:azure-repos', 0.95, { source: 'git', detail: `remote ${r.name} on Azure DevOps` });
-    } else if (h === 'bitbucket.org' || h.includes('bitbucket')) set.add('vcs:bitbucket', 0.9, { source: 'git', detail: `remote ${r.name} on ${h}` });
+      set.add('vcs:azure-repos', 0.95, { source: 'git', detail: `remote ${safeName(r.name, 40)} on Azure DevOps` });
+    } else if (h === 'bitbucket.org' || h.includes('bitbucket')) set.add('vcs:bitbucket', 0.9, { source: 'git', detail: `remote ${safeName(r.name, 40)} on ${safeName(h, 80)}` });
   }
 
   // Issue keys (PROJ-123) in branch names and commit subjects.
@@ -1314,7 +1351,6 @@ export function detectGit(git         , set           )       {
   if (strong.length > 0) {
     const [prefix, nums] = strong[0]                         ;
     set.add('tracker:issue-keys', 0.8, { source: 'git', detail: `${nums.size} issue keys like ${prefix}-${[...nums][0]} in branches/commits` });
-    set.add('tracker:jira', 0.45, { source: 'git', detail: `issue keys like ${prefix}-${[...nums][0]} (Jira-style)` });
   }
 
   // Linear-style branch names: user/eng-123-title
@@ -1355,7 +1391,7 @@ export function detectGit(git         , set           )       {
     const isRelease = /^(bump|release|version|prepare release|chore release)\b/.test(shape);
     set.add(isRelease ? 'workflow:releases' : 'workflow:repetitive-commits', count >= 15 ? 0.65 : 0.5, {
       source: 'git',
-      detail: `${count} recent commits start with "${shape}"`,
+      detail: `${count} recent commits start with "${safeName(shape, 40)}"`,
     });
   }
 }

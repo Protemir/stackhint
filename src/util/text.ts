@@ -20,6 +20,27 @@ export function sanitizeLine(value: unknown, max = 200): string {
   return sanitize(value, max).replace(/\s*\n\s*/g, ' ');
 }
 
+/**
+ * A name or path that came from the scanned project (server, skill, plugin, file, package, branch)
+ * on its way to a terminal or an agent: one line, no tags, short. Real names are identifiers, so a
+ * "name" that is a sentence with commands in it is an injection attempt and is not shown at all.
+ */
+export function safeName(value: unknown, max = 48): string {
+  const v = sanitizeLine(value, 400)
+    .replace(/</g, '‹')
+    .replace(/>/g, '›')
+    .replace(/`/g, "'");
+  if (v.split(/\s+/).length > 3 && /\b(ignore|disregard|instructions?|important|must|always|never|assistant|system|prompt|user (says|wants|asked)|you are|run|execute|install|npx|curl|wget|powershell|bash|sudo)\b/i.test(v)) {
+    return '(name hidden: it reads like an instruction)';
+  }
+  return v.length > max ? v.slice(0, max - 1).trimEnd() + '…' : v;
+}
+
+/** Remove terminal escapes and invisible or bidi characters from multi-line text, keeping the lines. */
+export function cleanLines(value: string): string {
+  return value.replace(ANSI, '').replace(/\r\n?/g, '\n').replace(/[^\S\n\t ]/g, ' ').replace(CONTROL, '');
+}
+
 /** Escape text for inclusion in Markdown so it cannot open links, HTML or code fences. */
 export function mdEscape(value: string): string {
   return value.replace(/[\\`*_[\]<>|#]/g, (c) => '\\' + c);
@@ -62,9 +83,15 @@ export function useColor(stream: NodeJS.WriteStream, env: NodeJS.ProcessEnv = pr
  * A path or word as a shell argument that works the same in PowerShell, cmd.exe and bash:
  * plain when safe, otherwise in double quotes (backslashes stay literal in all three).
  */
-export function shellArg(value: string): string {
+export function shellArg(value: string): string | undefined {
   if (/^[\w./:@=+-]+$/.test(value)) return value;
-  return /["$`]/.test(value) ? JSON.stringify(value) : `"${value}"`;
+  // Double quotes are safe in bash, PowerShell and cmd.exe only without characters that one of
+  // them still interprets there: " $ ` (bash, PowerShell), % ! (cmd), the typographic quotes
+  // PowerShell also treats as quotes, control characters, and a trailing backslash. A folder name
+  // with any of those is not printed into a command at all.
+  // eslint-disable-next-line no-control-regex
+  if (/["$`%!‘-‟\u0000-\u001f\u007f]/.test(value) || value.endsWith('\\')) return undefined;
+  return `"${value}"`;
 }
 
 export function plural(n: number, one: string, many = one + 's'): string {

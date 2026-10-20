@@ -7491,9 +7491,6 @@
         "Codex: `codex plugin add expo@openai-curated`, or open `/plugins` and install expo."
       ],
       "match": {
-        "urls": [
-          "mcp.expo.dev"
-        ],
         "plugins": [
           "expo@claude-plugins-official",
           "expo@openai-curated",
@@ -9224,7 +9221,8 @@
       },
       "match": {
         "urls": [
-          "mcp.digitalocean.com"
+          "mcp.digitalocean.com",
+          ".mcp.digitalocean.com"
         ],
         "packages": [
           "@digitalocean/mcp",

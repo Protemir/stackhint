@@ -82,7 +82,9 @@ export function resolveSpec(
 /** Batch shims like npx.cmd cannot be spawned directly by Claude Code or Codex on native Windows. */
 export function needsCmdWrapper(command        , platform                 , env                    = process.env)          {
   if (platform !== 'win32') return false;
-  if (/^(npx|npm|pnpm|pnpx|yarn|bunx)$/i.test(command)) return true;
+  // Known launchers are wrapped even when not installed yet (dnx comes with the .NET 10 SDK);
+  // cmd /c also runs an .exe, so wrapping is never wrong on Windows.
+  if (/^(npx|npm|pnpm|pnpx|yarn|bunx|dnx)$/i.test(command)) return true;
   const found = which(command, env, platform);
   return Boolean(found && /\.(cmd|bat)$/i.test(found));
 }

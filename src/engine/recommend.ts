@@ -16,6 +16,7 @@ import type {
 import { availabilityFor, hostLabel, primaryEntryFor, serverMatchScore, urlPatternIn } from '../hosts/inventory.ts';
 import { isLegacy, isRetired } from '../registry/registry.ts';
 import { platformName } from '../util/paths.ts';
+import { safeName, sanitizeLine } from '../util/text.ts';
 
 export interface RecommendOptions {
   hosts: HostId[];
@@ -130,7 +131,7 @@ export function recommend(ctx: ProjectContext, registry: Registry, inv: Inventor
     if (!primary || primary.score < 100) continue;
     for (const cap of primary.entry.provides) {
       const list = coveredBy.get(cap) ?? [];
-      const label = primary.entry.name.toLowerCase().includes(s.name.toLowerCase()) ? `${primary.entry.name} (${hostLabel(s.host)})` : `${primary.entry.name} as "${s.name}" (${hostLabel(s.host)})`;
+      const label = primary.entry.name.toLowerCase().includes(s.name.toLowerCase()) ? `${primary.entry.name} (${hostLabel(s.host)})` : `${primary.entry.name} as "${safeName(s.name, 40)}" (${hostLabel(s.host)})`;
       list.push({ host: s.host, entry: primary.entry, label, legacy: isRetired(primary.entry), viaCli: false });
       coveredBy.set(cap, list);
     }
@@ -185,8 +186,11 @@ export function recommend(ctx: ProjectContext, registry: Registry, inv: Inventor
     const availability: Partial<Record<HostId, Availability>> = {};
     for (const h of hosts) availability[h] = availabilityFor(entry, inv, h, registry.entries);
     const relevantHosts = hosts.filter((h) => availability[h]?.state !== 'incompatible');
-    const configuredHosts = relevantHosts.filter((h) => availability[h]?.state === 'configured');
-    const missingHosts = relevantHosts.filter((h) => availability[h]?.state !== 'configured');
+    // Disabled means "in the config, not active" (switched off, not approved, untrusted project):
+    // the fix is to enable it, not to install a second copy.
+    const present = (h: HostId): boolean => availability[h]?.state === 'configured' || availability[h]?.state === 'disabled';
+    const configuredHosts = relevantHosts.filter(present);
+    const missingHosts = relevantHosts.filter((h) => !present(h));
 
     // Equivalent capability already present (other entries).
     const overlaps = entry.provides.flatMap((cap) => (coveredBy.get(cap) ?? []).filter((c) => c.entry.id !== entry.id && missingHosts.includes(c.host)));
@@ -337,16 +341,20 @@ function evidenceText(r: Reason): string {
   const e = r.evidence[0];
   if (!e) return r.signal;
   if (e.source === 'task') return e.detail.replace(/^task mentions/, 'your task mentions');
-  if (e.source === 'git' || e.source === '.') return e.detail;
+  // Project-supplied names inside details went through safeName() where they were recorded;
+  // here the sentence only loses tags and control characters. The file path is a name.
+  const detail = sanitizeLine(e.detail, 160).replace(/</g, '‹').replace(/>/g, '›');
+  if (e.source === 'git' || e.source === '.') return detail;
+  const source = safeName(e.source, 80);
   // "package.json (package.json)" says the same thing twice.
   const base = e.source.split('/').pop() ?? e.source;
-  if (e.detail.toLowerCase() === base.toLowerCase()) return e.source;
-  return `${e.detail} (${e.source})`;
+  if (e.detail.toLowerCase() === base.toLowerCase()) return source;
+  return `${detail} (${source})`;
 }
 
 function whyNow(entry: RegistryEntry, reasons: Reason[], o: { legacyOverlap: string[]; activeOverlap: string[]; partialOverlap: string[]; cliOverlap: string[] }): string {
   const parts: string[] = [];
-  if (o.legacyOverlap.length) parts.push(`You still use ${o.legacyOverlap.join(', ')}, which is no longer maintained; this is its replacement.`);
+  if (o.legacyOverlap.length) parts.push(`${capitalize(o.legacyOverlap.join(', '))} is configured but no longer maintained; this is its replacement.`);
   const seen = new Set<string>();
   const facts: string[] = [];
   for (const r of reasons) {

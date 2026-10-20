@@ -72,7 +72,10 @@ export function readCodexInventory(projectRoot: string, env: Env = process.env, 
     collect(proj.value, projectConfig, 'project', servers, plugins);
     if (projectTrusted !== true) {
       // Codex only reads project config in trusted projects.
-      for (const s of servers.slice(before)) s.enabled = false;
+      for (const s of servers.slice(before)) {
+        s.enabled = false;
+        s.inactiveReason = 'Codex reads .codex/config.toml only in trusted projects: open this project in Codex and trust it';
+      }
       warnings.push('project .codex/config.toml is ignored by Codex until the project is trusted');
     }
   }

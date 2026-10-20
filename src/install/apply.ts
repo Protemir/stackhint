@@ -7,7 +7,7 @@ import type { HostId } from '../types.ts';
 import { readClaudeInventory } from '../hosts/claude.ts';
 import { decodeConfig, readBytes, readJson, sha256, writeAtomic } from '../util/fsx.ts';
 import { run, which, type RunResult } from '../util/exec.ts';
-import { displayPath, type Env } from '../util/paths.ts';
+import { displayPath, samePath, type Env } from '../util/paths.ts';
 import { redactString } from '../util/redact.ts';
 import { parseToml } from '../util/toml.ts';
 import type { Store } from '../state/store.ts';
@@ -290,7 +290,14 @@ export async function rollback(id: string, ctx: RollbackContext): Promise<{ stat
   if (m.method === 'file') {
     if (!m.target) return { status: 'failed', message: 'backup has no target' };
     const currentHash = sha256(readBytes(m.target, 4 * 1024 * 1024) ?? '');
+    // Later installs into the same file start from this install's result: restoring this
+    // backup would silently drop them (and undoing them later would bring this one back).
+    const target = m.target;
+    const later = listBackups(ctx.store).filter((b) => b.id !== m.id && b.method === 'file' && !b.rolledBack && b.target !== undefined && samePath(b.target, target) && b.at > m.at);
     if (currentHash !== m.afterHash && !ctx.force) {
+      if (later.length) {
+        return { status: 'failed', message: `${displayPath(m.target)} was changed again by later installs; roll those back first, newest first: ${[...later].sort((x, y) => y.at.localeCompare(x.at)).map((b) => `stackhint rollback ${b.id}`).join(', then ')}` };
+      }
       return { status: 'failed', message: `${displayPath(m.target)} changed after the install; rollback would discard those edits. Re-run with --force to restore the backup anyway.` };
     }
     const description = m.existedBefore ? `Restore ${displayPath(m.target)} to its state before ${m.at}` : `Delete ${displayPath(m.target)} (it did not exist before ${m.at})`;
@@ -303,6 +310,11 @@ export async function rollback(id: string, ctx: RollbackContext): Promise<{ stat
       fs.rmSync(m.target, { force: true });
       // A folder the install created (say ~/.codex) would otherwise make the host look installed.
       removeEmptyDirs((m.createdDirs ?? []).filter((d) => typeof d === 'string' && path.isAbsolute(d)));
+    }
+    // The file is now as it was before this install, so the later installs are gone too.
+    for (const b of later) {
+      b.rolledBack = `${new Date().toISOString()} (undone together with ${m.id})`;
+      fs.writeFileSync(path.join(ctx.store.backupsDir, b.id, 'manifest.json'), JSON.stringify(b, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
     }
   } else {
     if (!m.undoArgv || !m.undoExe) return { status: 'failed', message: 'this install has no automatic undo; remove it with the host CLI' };

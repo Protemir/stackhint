@@ -274,7 +274,8 @@ describe('git signals', () => {
     const r = set.toRecord();
     assert.ok((r['vcs:github']?.strength ?? 0) > 0.9);
     assert.ok(r['tracker:issue-keys']);
-    assert.ok(r['tracker:jira']);
+    // Keys say "a tracker", not which one (Linear and YouTrack keys look the same).
+    assert.ok(r['tracker:issue-keys'] && !r['tracker:jira']);
     assert.ok(r['tracker:linear']);
     assert.ok(r['workflow:repetitive-commits']?.evidence[0]?.detail.includes('add migration'));
   });
@@ -307,7 +308,7 @@ describe('git signals', () => {
     assert.ok(!JSON.stringify(info).includes('ghp_secret'), 'credentials leaked from the remote URL');
     assert.equal(info.recentSubjects.length, 3);
     const ctx = await analyzeProject(root, {});
-    assert.ok(has(ctx, 'tracker:jira'));
+    assert.ok(has(ctx, 'tracker:issue-keys'));
     assert.ok(has(ctx, 'vcs:github', 0.9));
   });
 });
