@@ -12,7 +12,7 @@ import { findEntry, searchRegistry } from '../registry/registry.js';
 import { planInstall } from '../install/plan.js';
 import { recommendationJson, renderExplain, renderFindings, renderPlan, renderRecommendations, renderStatus, style } from '../render/render.js';
 import { VERSION } from '../version.js';
-import { sanitizeLine } from '../util/text.js';
+import { sanitizeLine, shellArg } from '../util/text.js';
 import { explainPreviews } from '../commands.js';
 
 
@@ -138,7 +138,8 @@ export async function callTool(name        , args      , deps             = {}) 
       const s = await openSession({ ...common, ...(task ? { task } : {}) });
       const limit = typeof args['limit'] === 'number' ? Math.max(1, Math.min(20, Math.floor(args['limit']))) : 5;
       const r = runRecommend(s, { limit });
-      const text = renderRecommendations(md, s.ctx, s.hosts, r.recommendations, r.alreadyAvailable);
+      // The user runs the printed commands from their own terminal, so name the project explicitly.
+      const text = renderRecommendations(md, s.ctx, s.hosts, r.recommendations, r.alreadyAvailable, { projectArg: s.root });
       return { text: `${DATA_NOTE}\n\n${text}`, structured: { recommendations: r.recommendations.map(recommendationJson), alreadyAvailable: r.alreadyAvailable.map((x) => x.id) } };
     }
     case 'explain_tool': {
@@ -148,7 +149,7 @@ export async function callTool(name        , args      , deps             = {}) 
       const entry = findEntry(s.registry, id);
       if (!entry) return { text: `No registry entry "${sanitizeLine(id, 60)}". Try search_tools.`, isError: true };
       const r = runRecommend(s, { minScore: 0, limit: 200, includeDismissed: true });
-      const rec = [...r.recommendations, ...r.alreadyAvailable].find((x) => x.id === entry.id);
+      const rec = [...r.recommendations, ...r.alreadyAvailable, ...r.folded].find((x) => x.id === entry.id);
       return { text: `${DATA_NOTE}\n\n${renderExplain(md, rec, entry, s.hosts, explainPreviews(entry, s.hosts, s.platform), s.ctx)}` };
     }
     case 'search_tools': {
@@ -175,7 +176,8 @@ export async function callTool(name        , args      , deps             = {}) 
       const scope = args['scope'] === 'user' || args['scope'] === 'project' || args['scope'] === 'local' ? args['scope'] : undefined;
       const access = args['access'] === 'read' || args['access'] === 'write' ? args['access'] : undefined;
       const plan = planInstall({ entry, host: h, projectRoot: s.root, inventory: s.inventory, env, platform: s.platform, ...(scope ? { scope } : {}), ...(access ? { access } : {}) });
-      const cmd = `stackhint install ${entry.id} --host ${h}${scope ? ` --scope ${scope}` : ''}${access ? ` --access ${access}` : ''}`;
+      const where = shellArg(s.root);
+      const cmd = `stackhint install ${entry.id} --host ${h}${scope ? ` --scope ${scope}` : ''}${access ? ` --access ${access}` : ''} ${where}`;
       const tail = plan.blocked || plan.method === 'guided' ? '' : `\n\nNothing was changed. To install, the user runs this in a terminal and confirms:\n\n\`\`\`\n${cmd}\n\`\`\``;
       return { text: `${DATA_NOTE}\n\n${renderPlan(md, plan)}${tail}` };
     }
@@ -191,14 +193,22 @@ export async function callTool(name        , args      , deps             = {}) 
 
 
 
-export async function handleMessage(msg                , deps             = {})                            {
+export async function handleMessage(raw                          , deps             = {})                            {
+  const invalid       = { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } };
+  // `null`, a number or an array inside a batch: answer, never throw (that would end the session).
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return invalid;
+  const msg = raw                  ;
   const id = msg.id;
-  const isRequest = id !== undefined && id !== null;
+  // MCP ids are strings or integers; null or anything else is not a valid request id.
+  if (id !== undefined && !(typeof id === 'string' || (typeof id === 'number' && Number.isInteger(id)))) return invalid;
+  const isRequest = id !== undefined;
   const reply = (result      )       => ({ jsonrpc: '2.0', id: id                   , result });
   const fail = (code        , message        )       => ({ jsonrpc: '2.0', id: (id ?? null)                          , error: { code, message } });
-  if (typeof msg !== 'object' || msg === null || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
+  if (msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
     return isRequest ? fail(-32600, 'Invalid Request') : undefined;
   }
+  // A notification gets no reply, and a request method sent as a notification is not run.
+  if (!isRequest) return undefined;
   switch (msg.method) {
     case 'initialize': {
       const requested = typeof msg.params?.['protocolVersion'] === 'string' ? (msg.params['protocolVersion']          ) : '';
@@ -252,11 +262,22 @@ export function serveStdio(deps             = {})                {
           write({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
           return;
         }
-        const messages = Array.isArray(parsed) ? parsed : [parsed];
-        for (const m of messages) {
-          const res = await handleMessage(m                  , deps);
+        if (!Array.isArray(parsed)) {
+          const res = await handleMessage(parsed, deps);
           if (res) write(res);
+          return;
         }
+        // JSON-RPC batch (older MCP revisions): one array back, or one error for an empty batch.
+        if (parsed.length === 0) {
+          write({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } });
+          return;
+        }
+        const out         = [];
+        for (const m of parsed) {
+          const res = await handleMessage(m, deps);
+          if (res) out.push(res);
+        }
+        if (out.length) process.stdout.write(JSON.stringify(out) + '\n');
       });
     });
     rl.on('close', () => {

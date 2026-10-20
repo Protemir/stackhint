@@ -58,6 +58,15 @@ export function useColor(stream                    , env                    = pr
   return Boolean(stream.isTTY);
 }
 
+/**
+ * A path or word as a shell argument that works the same in PowerShell, cmd.exe and bash:
+ * plain when safe, otherwise in double quotes (backslashes stay literal in all three).
+ */
+export function shellArg(value        )         {
+  if (/^[\w./:@=+-]+$/.test(value)) return value;
+  return /["$`]/.test(value) ? JSON.stringify(value) : `"${value}"`;
+}
+
 export function plural(n        , one        , many = one + 's')         {
   return `${n} ${n === 1 ? one : many}`;
 }

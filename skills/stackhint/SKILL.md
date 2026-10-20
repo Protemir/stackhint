@@ -33,7 +33,7 @@ Installing changes the user's configuration, so never do it on your own initiati
 
 1. Show the plan first: `stackhint install <id> --host <claude|codex> --dry-run`
 2. Ask the user. If they agree, they can run `stackhint install <id> --host ...` in their terminal (it asks for confirmation). If they explicitly ask you to do it, run the same command with `--yes`.
-3. After installing, tell them which environment variables to set (the plan lists them) and how to undo: `stackhint rollback <id>`.
+3. After installing, tell them which environment variables to set (the plan lists them) and how to undo: `stackhint rollback <backup id>` with the backup id the install printed (`stackhint rollback` alone lists them; it is not the tool id).
 
 ## Other commands
 

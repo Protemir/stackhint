@@ -5,13 +5,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { HostId } from '../types.ts';
 import { readClaudeInventory } from '../hosts/claude.ts';
-import { readJson, readText, sha256, writeAtomic } from '../util/fsx.ts';
+import { decodeConfig, readBytes, readJson, sha256, writeAtomic } from '../util/fsx.ts';
 import { run, which, type RunResult } from '../util/exec.ts';
 import { displayPath, type Env } from '../util/paths.ts';
 import { redactString } from '../util/redact.ts';
 import { parseToml } from '../util/toml.ts';
 import type { Store } from '../state/store.ts';
-import type { InstallPlan } from './plan.ts';
+import { targetBytes, type InstallPlan } from './plan.ts';
 
 export type Runner = (exe: string, argv: string[], opts: { cwd?: string; env?: Env }) => Promise<RunResult>;
 
@@ -51,6 +51,8 @@ export interface BackupManifest {
   existedBefore?: boolean;
   beforeHash?: string;
   afterHash?: string;
+  /** Folders the install created for the target file; rollback removes them again if empty. */
+  createdDirs?: string[];
   /** For CLI installs: the command that undoes it, and where it must run. */
   undoArgv?: string[];
   undoExe?: string;
@@ -86,12 +88,14 @@ export async function applyPlan(plan: InstallPlan, ctx: ApplyContext): Promise<A
 async function applyFile(plan: InstallPlan, ctx: ApplyContext, nowMs: number): Promise<ApplyResult> {
   const target = plan.target;
   if (!target) return { status: 'failed', message: 'plan has no target file', verification: [] };
-  const current = readText(target.path, 4 * 1024 * 1024) ?? '';
+  const current = readBytes(target.path, 4 * 1024 * 1024) ?? Buffer.alloc(0);
   const existsNow = fs.existsSync(target.path);
   if (sha256(current) !== target.beforeHash || existsNow !== target.existed) {
     return { status: 'failed', message: `${displayPath(target.path)} changed after the plan was made; run the command again to see a fresh plan.`, verification: [] };
   }
 
+  const afterBytes = targetBytes(target);
+  const createdDirs = missingDirs(path.dirname(target.path));
   const id = newBackupId(nowMs, plan.entryId, plan.host);
   const dir = path.join(ctx.store.backupsDir, id);
   const manifest: BackupManifest = {
@@ -105,24 +109,37 @@ async function applyFile(plan: InstallPlan, ctx: ApplyContext, nowMs: number): P
     target: target.path,
     existedBefore: target.existed,
     beforeHash: target.beforeHash,
-    afterHash: sha256(target.after),
+    afterHash: sha256(afterBytes),
+    ...(createdDirs.length ? { createdDirs } : {}),
   };
   // Config files can hold tokens: keep backups private to the user.
   privateDir(ctx.store.backupsDir);
   privateDir(dir);
-  if (target.existed) fs.writeFileSync(path.join(dir, 'original'), current, { encoding: 'utf8', mode: 0o600 });
+  // The backup keeps the exact bytes, so rollback restores the file byte for byte.
+  if (target.existed) fs.writeFileSync(path.join(dir, 'original'), current, { mode: 0o600 });
   fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+  const dropBackup = (): void => {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  };
 
   try {
-    writeAtomic(target.path, target.after);
+    writeAtomic(target.path, afterBytes);
   } catch (e) {
+    dropBackup();
+    removeEmptyDirs(createdDirs);
     return { status: 'failed', message: `could not write ${displayPath(target.path)}: ${(e as Error).message}`, verification: [] };
   }
 
   const verification: string[] = [];
-  const problem = validateWritten(plan, target.path);
+  const problem = validateWritten(plan, target.path, afterBytes);
   if (problem) {
     restore(target.path, target.existed, current);
+    removeEmptyDirs(createdDirs);
+    dropBackup();
     ctx.store.audit('install-failed', { entry: plan.entryId, host: plan.host, target: target.path, reason: problem });
     return { status: 'failed', message: `validation failed, the original file was restored: ${problem}`, verification };
   }
@@ -153,10 +170,12 @@ function findHostCli(host: HostId, ctx: ApplyContext): string | undefined {
   return which(host, ctx.env ?? process.env, ctx.platform ?? process.platform);
 }
 
-function validateWritten(plan: InstallPlan, file: string): string | undefined {
-  const text = readText(file, 4 * 1024 * 1024);
-  if (text === undefined) return 'file cannot be read back';
-  if (plan.target && sha256(text) !== sha256(plan.target.after)) return 'file content differs from the plan';
+function validateWritten(plan: InstallPlan, file: string, expected: Buffer): string | undefined {
+  const bytes = readBytes(file, 4 * 1024 * 1024);
+  if (bytes === undefined) return 'file cannot be read back';
+  if (sha256(bytes) !== sha256(expected)) return 'file content differs from the plan';
+  const text = decodeConfig(bytes)?.text;
+  if (text === undefined) return 'file is not valid UTF-8 after the write';
   try {
     if (plan.target?.format === 'json') {
       const doc = JSON.parse(text) as { mcpServers?: Record<string, unknown> };
@@ -171,9 +190,31 @@ function validateWritten(plan: InstallPlan, file: string): string | undefined {
   return undefined;
 }
 
-function restore(file: string, existed: boolean, content: string): void {
+function restore(file: string, existed: boolean, content: Buffer): void {
   if (existed) writeAtomic(file, content);
   else fs.rmSync(file, { force: true });
+}
+
+/** Ancestors of `dir` that do not exist yet, deepest first. */
+function missingDirs(dir: string): string[] {
+  const out: string[] = [];
+  let p = dir;
+  while (!fs.existsSync(p) && path.dirname(p) !== p) {
+    out.push(p);
+    p = path.dirname(p);
+  }
+  return out;
+}
+
+/** Remove folders an install created, deepest first, but only while they are empty. */
+function removeEmptyDirs(dirs: string[]): void {
+  for (const d of dirs) {
+    try {
+      fs.rmdirSync(d);
+    } catch {
+      return;
+    }
+  }
 }
 
 async function applyCli(plan: InstallPlan, ctx: ApplyContext, nowMs: number): Promise<ApplyResult> {
@@ -248,19 +289,20 @@ export async function rollback(id: string, ctx: RollbackContext): Promise<{ stat
 
   if (m.method === 'file') {
     if (!m.target) return { status: 'failed', message: 'backup has no target' };
-    const current = readText(m.target, 4 * 1024 * 1024);
-    const currentHash = sha256(current ?? '');
+    const currentHash = sha256(readBytes(m.target, 4 * 1024 * 1024) ?? '');
     if (currentHash !== m.afterHash && !ctx.force) {
       return { status: 'failed', message: `${displayPath(m.target)} changed after the install; rollback would discard those edits. Re-run with --force to restore the backup anyway.` };
     }
     const description = m.existedBefore ? `Restore ${displayPath(m.target)} to its state before ${m.at}` : `Delete ${displayPath(m.target)} (it did not exist before ${m.at})`;
     if (!(await ctx.approve(description))) return { status: 'declined', message: 'Not approved; nothing was changed.' };
     if (m.existedBefore) {
-      const original = readText(path.join(dir, 'original'), 8 * 1024 * 1024);
+      const original = readBytes(path.join(dir, 'original'), 8 * 1024 * 1024);
       if (original === undefined) return { status: 'failed', message: 'backup copy is missing' };
       writeAtomic(m.target, original);
     } else {
       fs.rmSync(m.target, { force: true });
+      // A folder the install created (say ~/.codex) would otherwise make the host look installed.
+      removeEmptyDirs((m.createdDirs ?? []).filter((d) => typeof d === 'string' && path.isAbsolute(d)));
     }
   } else {
     if (!m.undoArgv || !m.undoExe) return { status: 'failed', message: 'this install has no automatic undo; remove it with the host CLI' };

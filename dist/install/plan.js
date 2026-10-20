@@ -6,7 +6,7 @@ import path from 'node:path';
 import { availabilityFor, hostLabel } from '../hosts/inventory.js';
 import { codexUserConfigPath } from '../hosts/codex.js';
 import { lineDiff } from '../util/diff.js';
-import { exists, readText, sha256, detectStyle } from '../util/fsx.js';
+import { decodeConfig, detectStyle, encodeConfig, exists, readBytes, sha256 } from '../util/fsx.js';
 import { shellQuote } from '../util/exec.js';
 import { displayPath,          } from '../util/paths.js';
 import { redactString } from '../util/redact.js';
@@ -42,6 +42,24 @@ import { claudeAddArgv, claudeServerJson, codexServerTable, resolveSpec, SpecErr
 
 
 
+
+
+
+
+/** Read a config file for editing, or a reason why it must not be rewritten. */
+export function readConfigForEdit(file        , env      )                                                                          {
+  if (!exists(file)) return { existed: false, text: '', bom: false, hash: sha256('') };
+  const bytes = readBytes(file, 4 * 1024 * 1024);
+  if (bytes === undefined) return `${displayPath(file, env)} exists but cannot be read (or is larger than 4 MB)`;
+  const decoded = decodeConfig(bytes);
+  if (!decoded) return `${displayPath(file, env)} is not valid UTF-8 text; stackhint will not rewrite it (save it as UTF-8 first)`;
+  return { existed: true, text: decoded.text, bom: decoded.bom, hash: sha256(bytes) };
+}
+
+/** What the target file will hold after the change, byte for byte. */
+export function targetBytes(t            )         {
+  return encodeConfig(t.after, t.bom);
+}
 
 
 
@@ -208,22 +226,23 @@ function planClaude(plan             , req             , r              , platfo
       plan.blocked = escape;
       return;
     }
-    const before = readText(target, 4 * 1024 * 1024);
-    const existed = exists(target);
-    if (existed && before === undefined) {
-      plan.blocked = `${displayPath(target)} exists but cannot be read`;
+    const cur = readConfigForEdit(target);
+    if (typeof cur === 'string') {
+      plan.blocked = cur;
       return;
     }
+    const server = claudeServerJson(r, platform);
     let after        ;
     try {
-      after = mergeMcpJson(before ?? '', r.serverName, claudeServerJson(r, platform));
+      after = mergeMcpJson(cur.text, r.serverName, server);
     } catch (e) {
       plan.blocked = (e         ).message;
       return;
     }
     plan.method = 'file';
-    plan.target = { path: target, format: 'json', existed, beforeHash: sha256(before ?? ''), before: before ?? '', after };
-    plan.diff = redactString(lineDiff(before ?? '', after));
+    plan.target = { path: target, format: 'json', existed: cur.existed, beforeHash: cur.hash, before: cur.text, after, bom: cur.bom };
+    plan.diff = redactString(lineDiff(cur.text, after));
+    if (server['command'] === 'cmd' && r.spec.command !== 'cmd') plan.warnings.push(crossPlatformWarning('.mcp.json', r.spec.command          , 'local'));
     plan.sideEffects.push('.mcp.json is usually committed, so teammates get this server too; Claude Code asks each person to approve project servers.');
     plan.rollback = 'stackhint rollback (the backup id is printed after the change)';
     return;
@@ -258,27 +277,44 @@ function planCodex(plan             , req             , r              , env    
     plan.blocked = escape;
     return;
   }
-  const existed = exists(target);
-  const before = readText(target, 4 * 1024 * 1024);
-  if (existed && before === undefined) {
-    plan.blocked = `${displayPath(target, env)} exists but cannot be read`;
+  const cur = readConfigForEdit(target, env);
+  if (typeof cur === 'string') {
+    plan.blocked = cur;
     return;
   }
   const table = codexServerTable(r, platform);
   let after        ;
   try {
-    after = appendCodexServer(before ?? '', r.serverName, table, `${plan.entryName} (stackhint ${new Date(req.now ?? Date.now()).toISOString().slice(0, 10)})`);
+    after = appendCodexServer(cur.text, r.serverName, table, `${plan.entryName} (stackhint ${new Date(req.now ?? Date.now()).toISOString().slice(0, 10)})`);
   } catch (e) {
     plan.blocked = (e         ).message;
     return;
   }
   plan.method = 'file';
-  plan.target = { path: target, format: 'toml', existed, beforeHash: sha256(before ?? ''), before: before ?? '', after };
-  plan.diff = redactString(lineDiff(before ?? '', after));
+  plan.target = { path: target, format: 'toml', existed: cur.existed, beforeHash: cur.hash, before: cur.text, after, bom: cur.bom };
+  plan.diff = redactString(lineDiff(cur.text, after));
   plan.command = `stackhint writes the [mcp_servers.${r.serverName}] table shown below`;
-  if (scope === 'project') plan.sideEffects.push('Codex reads .codex/config.toml only in trusted projects.');
+  const link = linkTarget(target);
+  if (link) plan.sideEffects.push(`${displayPath(target, env)} is a symbolic link; the change goes to ${displayPath(link, env)}.`);
+  if (scope === 'project') {
+    plan.sideEffects.push('Codex reads .codex/config.toml only in trusted projects.');
+    if (table['command'] === 'cmd' && r.spec.command !== 'cmd') plan.warnings.push(crossPlatformWarning('.codex/config.toml', r.spec.command          , 'user'));
+  }
   plan.sideEffects.push('Appends one table; the rest of the file is left byte-for-byte as it is.');
   plan.rollback = 'stackhint rollback (the backup id is printed after the change)';
+}
+
+function crossPlatformWarning(file        , command        , privateScope        )         {
+  return `${file} gets \`cmd /c ${command}\` so the server starts on Windows; teammates on macOS or Linux need plain \`${command}\`. For a mixed team, use --scope ${privateScope} instead.`;
+}
+
+/** The real file behind a symbolic link, if the path is one. */
+function linkTarget(file        )                     {
+  try {
+    return fs.lstatSync(file).isSymbolicLink() ? fs.realpathSync(file) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -329,19 +365,117 @@ export function mergeMcpJson(before        , name        , server               
   const servers = obj['mcpServers'];
   if (servers !== undefined && (!servers || typeof servers !== 'object' || Array.isArray(servers))) throw new Error('"mcpServers" in .mcp.json is not an object');
   if (servers && Object.prototype.hasOwnProperty.call(servers, name)) throw new ConflictError(`.mcp.json already has a server named "${name}"; pick another name with --name`);
-  const out                          = {};
-  let placed = false;
-  for (const [k, v] of Object.entries(obj)) {
-    if (k === 'mcpServers') {
-      out[k] = { ...(v                           ), [name]: server };
-      placed = true;
-    } else out[k] = v;
-  }
-  if (!placed) out['mcpServers'] = { [name]: server };
+
+  // Insert into the text instead of re-serializing, so everything else stays byte for byte
+  // (big numbers, key order, "__proto__" keys, spacing).
   const style = detectStyle(before);
-  let text = JSON.stringify(out, null, style.indent);
-  if (style.eol !== '\n') text = text.replace(/\n/g, style.eol);
-  return text + (style.finalNewline ? style.eol : '');
+  const top = jsonObjectAt(before, before.search(/\S/));
+  const lastTop = [...top.members].reverse().find((m) => m.key === 'mcpServers');
+  let after        ;
+  if (lastTop && before[lastTop.valueStart] === '{') {
+    const inner = jsonObjectAt(before, lastTop.valueStart);
+    after = insertMember(before, inner, lastTop, name, server, style);
+  } else {
+    after = insertMember(before, top, undefined, 'mcpServers', { [name]: server }, style);
+  }
+  // The edit must parse, add exactly our server, and leave every other value as it was.
+  let parsed                         ;
+  try {
+    parsed = JSON.parse(after)                           ;
+  } catch (e) {
+    throw new Error(`internal check failed: the edited .mcp.json does not parse (${(e         ).message})`);
+  }
+  const added = (parsed['mcpServers']                                       )?.[name];
+  const same = (a         , b         )          => JSON.stringify(a) === JSON.stringify(b);
+  const restBefore = { ...(servers                                       ) };
+  const restAfter = { ...(parsed['mcpServers']                           ) };
+  delete restAfter[name];
+  const othersSame = Object.keys(obj).every((k) => k === 'mcpServers' || same(obj[k], parsed[k])) && Object.keys(parsed).every((k) => k === 'mcpServers' || k in obj);
+  if (!same(added, server) || !same(restBefore, restAfter) || !othersSame) throw new Error('internal check failed: could not add the server to .mcp.json without changing other values');
+  return after;
+}
+
+
+
+
+
+
+
+
+
+/** Members of the JSON object whose `{` is at `open`. The text is already known to be valid JSON. */
+function jsonObjectAt(src        , open        )                                                         {
+  const members               = [];
+  let i = open + 1;
+  for (;;) {
+    while (/\s|,/.test(src[i] ?? '')) i++;
+    if (src[i] === '}' || i >= src.length) return { open, close: i, members };
+    const keyStart = i;
+    const keyEnd = jsonValueEnd(src, i);
+    const key = JSON.parse(src.slice(keyStart, keyEnd))          ;
+    i = keyEnd;
+    while (/\s/.test(src[i] ?? '')) i++;
+    i++; // ':'
+    while (/\s/.test(src[i] ?? '')) i++;
+    const valueStart = i;
+    const valueEnd = jsonValueEnd(src, i);
+    members.push({ key, keyStart, keyEnd, valueStart, valueEnd });
+    i = valueEnd;
+  }
+}
+
+/** Index just past the JSON value that starts at `i`. */
+function jsonValueEnd(src        , i        )         {
+  const c = src[i];
+  if (c === '"') {
+    let j = i + 1;
+    while (j < src.length && src[j] !== '"') j += src[j] === '\\' ? 2 : 1;
+    return j + 1;
+  }
+  if (c === '{' || c === '[') {
+    let depth = 0;
+    let j = i;
+    while (j < src.length) {
+      const d = src[j];
+      if (d === '"') {
+        j = jsonValueEnd(src, j);
+        continue;
+      }
+      if (d === '{' || d === '[') depth++;
+      else if (d === '}' || d === ']') {
+        depth--;
+        if (depth === 0) return j + 1;
+      }
+      j++;
+    }
+    return j;
+  }
+  let j = i;
+  while (j < src.length && !/[\s,}\]]/.test(src[j]          )) j++;
+  return j;
+}
+
+/** Add `"key": value` as the last member of `obj`, in the style the file already uses. */
+function insertMember(src        , obj                                                        , owner                        , key        , value         , style                                 )         {
+  const lineIndent = (pos        )                     => {
+    const lineStart = src.lastIndexOf('\n', pos - 1) + 1;
+    const prefix = src.slice(lineStart, pos);
+    return /^[ \t]*$/.test(prefix) ? prefix : undefined;
+  };
+  const multiline = src.slice(obj.open, obj.close).includes('\n') || (obj.members.length === 0 && src.includes('\n'));
+  const block = (v         , base        )         => (multiline ? JSON.stringify(v, null, style.indent).replace(/\n/g, style.eol + base) : JSON.stringify(v));
+  const last = obj.members[obj.members.length - 1];
+  if (last) {
+    const sep = src.slice(last.keyEnd, last.valueStart);
+    const indent = lineIndent(last.keyStart);
+    const text = indent !== undefined && multiline ? `,${style.eol}${indent}${JSON.stringify(key)}${sep}${block(value, indent)}` : `, ${JSON.stringify(key)}${sep}${JSON.stringify(value)}`;
+    return src.slice(0, last.valueEnd) + text + src.slice(last.valueEnd);
+  }
+  // Empty object: lay it out one level deeper than the line that holds it.
+  const outer = owner ? (lineIndent(owner.keyStart) ?? '') : '';
+  const inner = outer + style.indent;
+  const body = multiline ? `{${style.eol}${inner}${JSON.stringify(key)}: ${block(value, inner)}${style.eol}${outer}}` : `{ ${JSON.stringify(key)}: ${JSON.stringify(value)} }`;
+  return src.slice(0, obj.open) + body + src.slice(obj.close + 1);
 }
 
 export function appendCodexServer(before        , name        , table                              , label        )         {

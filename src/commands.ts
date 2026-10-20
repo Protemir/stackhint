@@ -7,6 +7,7 @@ import type { HostId, RegistryEntry } from './types.ts';
 import { HOST_IDS } from './types.ts';
 import { openSession, runRecommend, type Session } from './app.ts';
 import { checkConfig } from './engine/check.ts';
+import { projectRootFor } from './hooks/hooks.ts';
 import { hostLabel } from './hosts/inventory.ts';
 import { applyPlan, listBackups, rollback, type Runner } from './install/apply.ts';
 import { planInstall, type Scope } from './install/plan.ts';
@@ -25,11 +26,11 @@ import {
   style,
   type Format,
 } from './render/render.ts';
-import { CONFIG_KEYS, Store } from './state/store.ts';
+import { CONFIG_KEYS, Store, type Dismissal } from './state/store.ts';
 import { parseDuration } from './util/duration.ts';
 import { run, which } from './util/exec.ts';
 import { readText, writeAtomic } from './util/fsx.ts';
-import { displayPath, type Env } from './util/paths.ts';
+import { claudeConfigDir, displayPath, homeDir, type Env } from './util/paths.ts';
 import { redactDeep } from './util/redact.ts';
 import { sanitizeLine } from './util/text.ts';
 import { tomlTable } from './util/toml.ts';
@@ -64,10 +65,27 @@ function hostOpt(h: string | undefined): HostId | 'all' | undefined {
   throw new UsageError('--host must be claude, codex or all');
 }
 
+/**
+ * The project a command works on: an explicit path, or the current folder. That is also what
+ * Claude Code treats as the project (where it was started), so installs land where it looks.
+ */
+function projectRoot(io: IO, root: string | undefined): string {
+  if (root === undefined) return path.resolve(io.cwd);
+  const abs = path.resolve(io.cwd, root);
+  let isDir = false;
+  try {
+    isDir = fs.statSync(abs).isDirectory();
+  } catch {
+    isDir = false;
+  }
+  if (!isDir) throw new UsageError(`not a folder: ${displayPath(abs, io.env)}`);
+  return abs;
+}
+
 async function session(io: IO, root: string | undefined, extra: { task?: string; host?: string; skipScan?: boolean } = {}): Promise<Session> {
   const host = hostOpt(extra.host);
   return openSession({
-    root: path.resolve(io.cwd, root ?? '.'),
+    root: projectRoot(io, root),
     env: io.env,
     platform: io.platform,
     now: io.now,
@@ -124,7 +142,7 @@ export async function cmdRecommend(io: IO, o: { path?: string; task?: string; ho
     return 0;
   }
   warn(io, s, format);
-  io.out(renderRecommendations(style(format, io.color), s.ctx, s.hosts, r.recommendations, r.alreadyAvailable));
+  io.out(renderRecommendations(style(format, io.color), s.ctx, s.hosts, r.recommendations, r.alreadyAvailable, o.path ? { projectArg: o.path } : {}));
   return 0;
 }
 
@@ -156,7 +174,7 @@ export async function cmdExplain(io: IO, o: { id: string; path?: string; host?: 
     return 1;
   }
   const r = runRecommend(s, { minScore: 0, limit: 500, includeDismissed: true });
-  const rec = [...r.recommendations, ...r.alreadyAvailable].find((x) => x.id === entry.id);
+  const rec = [...r.recommendations, ...r.alreadyAvailable, ...r.folded].find((x) => x.id === entry.id);
   if (format === 'json') {
     json(io, { entry: redactDeep(entry), recommendation: rec ? recommendationJson(rec) : null, previews: explainPreviews(entry, s.hosts, s.platform) });
     return 0;
@@ -343,7 +361,8 @@ export async function cmdInstall(
   }
 }
 
-export async function cmdTry(io: IO, o: { id: string; path?: string; host?: string; param?: string[]; access?: string }): Promise<number> {
+export async function cmdTry(io: IO, o: { id: string; path?: string; host?: string; param?: string[]; access?: string; format?: string }): Promise<number> {
+  const format = fmt(o.format);
   const s = await session(io, o.path, { skipScan: true });
   const entry = findEntry(s.registry, o.id);
   if (!entry) {
@@ -365,12 +384,26 @@ export async function cmdTry(io: IO, o: { id: string; path?: string; host?: stri
   if (host === 'claude') {
     const file = path.join(s.store.home, 'try', `${entry.id}.mcp.json`);
     writeAtomic(file, JSON.stringify({ mcpServers: { [r.serverName]: claudeServerJson(r, s.platform) } }, null, 2) + '\n');
+    if (format === 'json') {
+      json(io, { id: entry.id, host, command: tryCommand('claude', r, file, s.platform), configFile: file, requiredEnv: r.requiredEnv });
+      return 0;
+    }
     io.out(`Wrote a temporary MCP config to ${displayPath(file)} (your Claude Code config is not changed).`);
     io.out('Start one session with it:');
     io.out(`  ${tryCommand('claude', r, file, s.platform)}`);
   } else {
+    const win = s.platform === 'win32';
+    // PowerShell and bash need different quoting for the TOML values; Windows users have both.
+    const posix = tryCommand('codex', r, '', s.platform, 'posix');
+    if (format === 'json') {
+      json(io, { id: entry.id, host, command: tryCommand('codex', r, '', s.platform), ...(win ? { commandPosix: posix } : {}), requiredEnv: r.requiredEnv });
+      return 0;
+    }
     io.out('Start one Codex session with the server (config.toml is not changed):');
-    io.out(`  ${tryCommand('codex', r, '', s.platform)}`);
+    if (win) {
+      io.out(`  PowerShell:  ${tryCommand('codex', r, '', s.platform, 'powershell')}`);
+      io.out(`  Git Bash:    ${posix}`);
+    } else io.out(`  ${posix}`);
   }
   if (r.requiredEnv.length) io.out(`It needs ${r.requiredEnv.join(', ')} set in that shell.`);
   return 0;
@@ -378,7 +411,8 @@ export async function cmdTry(io: IO, o: { id: string; path?: string; host?: stri
 
 // ---------------- dismiss / rollback ----------------
 
-export async function cmdDismiss(io: IO, o: { id: string; for?: string; project?: boolean; reason?: string; path?: string }): Promise<number> {
+export async function cmdDismiss(io: IO, o: { id: string; for?: string; project?: boolean; reason?: string; path?: string; format?: string }): Promise<number> {
+  const format = fmt(o.format);
   const s = await session(io, o.path, { skipScan: true });
   const entry = findEntry(s.registry, o.id);
   if (!entry) {
@@ -390,33 +424,62 @@ export async function cmdDismiss(io: IO, o: { id: string; for?: string; project?
     forMs = parseDuration(o.for);
     if (!forMs) throw new UsageError('--for expects a duration like 30m, 12h, 14d or 2w');
   }
-  const d = s.store.dismiss(entry.id, { ...(forMs ? { forMs } : {}), ...(o.project ? { projectKey: s.projectKey } : {}), ...(o.reason ? { reason: o.reason } : {}) });
-  io.out(`${entry.name}: hidden ${d.until ? `until ${d.until.slice(0, 16).replace('T', ' ')}` : 'for good'}${d.project ? ' in this project' : ''}. Undo with: stackhint undismiss ${entry.id}`);
+  // The same project can be keyed by this folder, its git root (hooks outside Claude Code) or the
+  // folder a Claude Code session was opened in: hide the tool under all of them.
+  const projectKeys = o.project
+    ? [s.projectKey, s.store.projectKey(projectRootFor({ cwd: s.root }, { ...io.env, CLAUDE_PROJECT_DIR: undefined })), ...(io.env['CLAUDE_PROJECT_DIR'] ? [s.store.projectKey(io.env['CLAUDE_PROJECT_DIR'])] : [])]
+    : [];
+  const d = s.store.dismiss(entry.id, { ...(forMs ? { forMs } : {}), ...(o.project ? { projectKey: s.projectKey, projectKeys } : {}), ...(o.reason ? { reason: o.reason } : {}) });
+  if (format === 'json') {
+    json(io, { id: entry.id, until: d.until ?? null, project: Boolean(d.project), reason: d.reason ?? null });
+    return 0;
+  }
+  io.out(`${entry.name}: hidden ${d.until ? `until ${localTime(d.until)}` : 'for good'}${d.project ? ' in this project' : ''}. Undo with: stackhint undismiss ${entry.id}`);
   return 0;
 }
 
-export async function cmdUndismiss(io: IO, o: { id: string }): Promise<number> {
-  const store = new Store(io.env, io.now);
-  const had = store.undismiss(o.id.toLowerCase());
-  io.out(had ? `${o.id} can be suggested again.` : `${o.id} was not dismissed.`);
+export async function cmdUndismiss(io: IO, o: { id: string; format?: string }): Promise<number> {
+  const format = fmt(o.format);
+  const s = await session(io, undefined, { skipScan: true });
+  // Same lookup as dismiss, so the full name works both ways.
+  const id = findEntry(s.registry, o.id)?.id ?? o.id.toLowerCase();
+  const had = s.store.undismiss(id);
+  if (format === 'json') {
+    json(io, { id, wasDismissed: had });
+    return 0;
+  }
+  io.out(had ? `${id} can be suggested again.` : `${id} was not dismissed.`);
   return 0;
 }
 
-export async function cmdDismissed(io: IO): Promise<number> {
+export async function cmdDismissed(io: IO, o: { format?: string } = {}): Promise<number> {
+  const format = fmt(o.format);
   const store = new Store(io.env, io.now);
   const state = store.loadState();
-  const ids = Object.keys(state.dismissed).filter((id) => (state.dismissed[id] ?? []).length);
+  const nowMs = io.now();
+  // Expired snoozes no longer hide anything, so they are not listed.
+  const active = (id: string): Dismissal[] => (state.dismissed[id] ?? []).filter((d) => !d.until || Date.parse(d.until) > nowMs);
+  const ids = Object.keys(state.dismissed).filter((id) => active(id).length);
+  if (format === 'json') {
+    json(io, { dismissed: ids.flatMap((id) => active(id).map((d) => ({ id, until: d.until ?? null, project: d.project ?? null, reason: d.reason ?? null }))) });
+    return 0;
+  }
   if (!ids.length) io.out('Nothing dismissed.');
   for (const id of ids) {
-    for (const d of state.dismissed[id] ?? []) io.out(`${id}: ${d.until ? `until ${d.until.slice(0, 10)}` : 'forever'}${d.project ? ' (one project)' : ''}${d.reason ? ` - ${sanitizeLine(d.reason, 80)}` : ''}`);
+    for (const d of active(id)) io.out(`${id}: ${d.until ? `until ${localTime(d.until)}` : 'forever'}${d.project ? ' (one project)' : ''}${d.reason ? ` - ${sanitizeLine(d.reason, 80)}` : ''}`);
   }
   return 0;
 }
 
-export async function cmdRollback(io: IO, o: { id?: string; yes?: boolean; force?: boolean }): Promise<number> {
+export async function cmdRollback(io: IO, o: { id?: string; yes?: boolean; force?: boolean; format?: string }): Promise<number> {
+  const format = fmt(o.format);
   const store = new Store(io.env, io.now);
   if (!o.id) {
     const list = listBackups(store);
+    if (format === 'json') {
+      json(io, { installs: list.map((m) => ({ id: m.id, entry: m.entryId, host: m.host, scope: m.scope, at: m.at, target: m.target ?? null, rolledBack: m.rolledBack ?? null })) });
+      return 0;
+    }
     if (!list.length) {
       io.out('No installs to roll back.');
       return 0;
@@ -425,16 +488,17 @@ export async function cmdRollback(io: IO, o: { id?: string; yes?: boolean; force
     for (const m of list.slice(0, 20)) {
       io.out(`  ${m.id}  ${m.entryId} -> ${hostLabel(m.host)} ${m.scope}${m.target ? ` (${displayPath(m.target, io.env)})` : ''}${m.rolledBack ? '  [rolled back]' : ''}`);
     }
-    io.out('Roll one back with: stackhint rollback <id>');
+    io.out('Roll one back with: stackhint rollback <backup id from this list>');
     return 0;
   }
+  if (format === 'json' && !o.yes) throw new UsageError('rollback with --format json needs --yes (JSON mode cannot ask)');
   const res = await rollback(o.id, {
     store,
     ...(o.force ? { force: true } : {}),
     env: io.env,
     ...(io.runner ? { runner: io.runner } : {}),
     approve: async (description) => {
-      io.out(description);
+      if (format !== 'json') io.out(description);
       if (o.yes) return true;
       if (!io.interactive) {
         io.err('No terminal to confirm in; pass --yes to approve.');
@@ -443,22 +507,34 @@ export async function cmdRollback(io: IO, o: { id?: string; yes?: boolean; force
       return io.confirm('Proceed? [y/N] ');
     },
   });
-  (res.status === 'done' ? io.out : io.err)(res.message);
+  if (format === 'json') json(io, { id: o.id, status: res.status, message: res.message });
+  else (res.status === 'done' ? io.out : io.err)(res.message);
   return res.status === 'done' ? 0 : res.status === 'declined' ? 3 : 1;
 }
 
 // ---------------- config / doctor ----------------
 
-export async function cmdConfig(io: IO, o: { action?: string; key?: string; value?: string }): Promise<number> {
+export async function cmdConfig(io: IO, o: { action?: string; key?: string; value?: string; format?: string }): Promise<number> {
+  const format = fmt(o.format);
   const store = new Store(io.env, io.now);
   const action = o.action ?? 'show';
   if (action === 'show' || action === 'get') {
     const { config, warnings } = store.loadConfig();
     for (const w of warnings) io.err(`warning: ${w}`);
     if (action === 'get' && o.key) {
-      const v = o.key.split('.').reduce<unknown>((acc, k) => (acc && typeof acc === 'object' ? (acc as Record<string, unknown>)[k] : undefined), config);
-      if (v === undefined) throw new UsageError(`unknown config key "${o.key}"`);
-      io.out(typeof v === 'object' ? JSON.stringify(v) : String(v));
+      const key = o.key;
+      // Only real settings: "constructor" or "toString" are not config keys.
+      if (!Object.keys(CONFIG_KEYS).some((k) => k === key || k.startsWith(key + '.'))) {
+        throw new UsageError(`unknown config key "${sanitizeLine(key, 60)}". Known: ${Object.keys(CONFIG_KEYS).join(', ')}`);
+      }
+      const v = key.split('.').reduce<unknown>((acc, k) => (acc && typeof acc === 'object' && Object.prototype.hasOwnProperty.call(acc, k) ? (acc as Record<string, unknown>)[k] : undefined), config);
+      if (v === undefined) throw new UsageError(`unknown config key "${sanitizeLine(key, 60)}"`);
+      if (format === 'json') json(io, { key, value: v });
+      else io.out(typeof v === 'object' ? JSON.stringify(v) : String(v));
+      return 0;
+    }
+    if (format === 'json') {
+      json(io, { config, file: store.configPath });
       return 0;
     }
     io.out(JSON.stringify(config, null, 2));
@@ -473,19 +549,21 @@ export async function cmdConfig(io: IO, o: { action?: string; key?: string; valu
       io.err((e as Error).message);
       return 2;
     }
-    io.out(`${o.key} = ${o.value}`);
+    if (format === 'json') json(io, { key: o.key, value: o.value });
+    else io.out(`${o.key} = ${o.value}`);
     return 0;
   }
   throw new UsageError(`config ${action}: use show, get <key> or set <key> <value>. Keys: ${Object.keys(CONFIG_KEYS).join(', ')}`);
 }
 
-export async function cmdDoctor(io: IO, o: { path?: string }): Promise<number> {
+export async function cmdDoctor(io: IO, o: { path?: string; format?: string }): Promise<number> {
+  const format = fmt(o.format);
   const s = await session(io, o.path, { skipScan: true });
-  const ok = (m: string): void => io.out(`  ok    ${m}`);
-  const bad = (m: string): void => io.out(`  FIX   ${m}`);
-  const note = (m: string): void => io.out(`  note  ${m}`);
+  const checks: Array<{ level: 'ok' | 'fix' | 'note'; message: string }> = [];
+  const ok = (m: string): void => void checks.push({ level: 'ok', message: m });
+  const bad = (m: string): void => void checks.push({ level: 'fix', message: m });
+  const note = (m: string): void => void checks.push({ level: 'note', message: m });
   let problems = 0;
-  io.out(`stackhint ${VERSION} on Node.js ${process.versions.node} (${s.platform})`);
   const major = Number(process.versions.node.split('.')[0]);
   if (major >= 20) ok('Node.js 20 or newer');
   else {
@@ -533,6 +611,13 @@ export async function cmdDoctor(io: IO, o: { path?: string }): Promise<number> {
   const hooked = s.inventory.plugins.some((p) => p.id.startsWith('stackhint@') && p.enabled);
   note(hooked ? 'stackhint plugin is enabled in Claude Code (session hints active)' : 'stackhint plugin not enabled in Claude Code; hints only on request');
   for (const w of s.inventory.warnings) note(w);
+  if (format === 'json') {
+    json(io, { version: VERSION, node: process.versions.node, platform: s.platform, problems, checks });
+    return problems ? 1 : 0;
+  }
+  io.out(`stackhint ${VERSION} on Node.js ${process.versions.node} (${s.platform})`);
+  const tag = { ok: 'ok  ', fix: 'FIX ', note: 'note' } as const;
+  for (const c of checks) io.out(`  ${tag[c.level]}  ${c.message}`);
   io.out(problems ? `${problems} problem${problems === 1 ? '' : 's'} found.` : 'No problems found.');
   return problems ? 1 : 0;
 }
@@ -603,7 +688,8 @@ export async function cmdSetup(io: IO, o: { host?: string; dryRun?: boolean; yes
   // 2) Skill copy with the CLI path filled in.
   const skillSrc = path.resolve(path.dirname(cli), '..', 'skills', 'stackhint', 'SKILL.md');
   const skillText = readText(skillSrc);
-  const skillDir = host === 'claude' ? path.join(io.env['CLAUDE_CONFIG_DIR'] ?? path.join(homeOf(io.env), '.claude'), 'skills', 'stackhint') : path.join(homeOf(io.env), '.agents', 'skills', 'stackhint');
+  // Same home as the config paths above (os.homedir), not $HOME: under MSYS2 or Cygwin they differ.
+  const skillDir = host === 'claude' ? path.join(claudeConfigDir(io.env), 'skills', 'stackhint') : path.join(homeDir(io.env), '.agents', 'skills', 'stackhint');
   const skillTarget = path.join(skillDir, 'SKILL.md');
   const skillExists = fs.existsSync(skillTarget);
   if (skillText) io.out(`\nSkill: ${skillExists ? 'replace' : 'create'} ${displayPath(skillTarget, io.env)} (CLI path: ${displayPath(cli, io.env)})`);
@@ -628,11 +714,18 @@ export async function cmdSetup(io: IO, o: { host?: string; dryRun?: boolean; yes
   return result.status === 'applied' || result.status === 'blocked' ? 0 : 1;
 }
 
-function homeOf(env: Env): string {
-  return env['STACKHINT_TEST_HOME'] ?? env['HOME'] ?? env['USERPROFILE'] ?? process.cwd();
-}
-
 // ---------------- helpers for the CLI ----------------
+
+/** Local wall-clock time with its UTC offset, e.g. "2026-10-20 13:21 (UTC+05:00)". */
+export function localTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? '+' : '-';
+  const zone = `UTC${sign}${pad(Math.floor(Math.abs(off) / 60))}:${pad(Math.abs(off) % 60)}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())} (${zone})`;
+}
 
 function hint(s: Session, id: string): string {
   const near = suggestIds(s.registry, id);

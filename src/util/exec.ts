@@ -6,7 +6,8 @@ import type { Env } from './paths.ts';
 /** Find an executable on PATH without running anything. */
 export function which(name: string, env: Env = process.env, platform: NodeJS.Platform = process.platform): string | undefined {
   const pathVar = env['PATH'] ?? env['Path'] ?? '';
-  const dirs = pathVar.split(platform === 'win32' ? ';' : ':').filter(Boolean);
+  // Windows allows quoted entries such as "C:\Program Files\nodejs"; cmd.exe strips the quotes too.
+  const dirs = pathVar.split(platform === 'win32' ? ';' : ':').map((d) => (platform === 'win32' ? d.replace(/"/g, '') : d)).filter(Boolean);
   const exts =
     platform === 'win32'
       ? ['', ...(env['PATHEXT'] ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean).map((e) => e.toLowerCase())]
@@ -29,6 +30,41 @@ export function which(name: string, env: Env = process.env, platform: NodeJS.Pla
     }
   }
   return undefined;
+}
+
+/**
+ * which() for many names at once: each PATH folder is listed once instead of probing every
+ * name and extension with stat (25 names x 40 folders x 5 extensions is slow on Windows).
+ */
+export function whichMany(names: readonly string[], env: Env = process.env, platform: NodeJS.Platform = process.platform): Record<string, string> {
+  const win = platform === 'win32';
+  const pathVar = env['PATH'] ?? env['Path'] ?? '';
+  const dirs = pathVar.split(win ? ';' : ':').map((d) => (win ? d.replace(/"/g, '') : d)).filter(Boolean);
+  const exts = win ? ['', ...(env['PATHEXT'] ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean).map((e) => e.toLowerCase())] : [''];
+  const out: Record<string, string> = {};
+  for (const dir of dirs) {
+    let listing: string[];
+    try {
+      listing = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    const present = new Set(win ? listing.map((f) => f.toLowerCase()) : listing);
+    for (const name of names) {
+      if (out[name] !== undefined) continue;
+      for (const ext of exts) {
+        if (!present.has(win ? (name + ext).toLowerCase() : name + ext)) continue;
+        // Same rules as which(): a regular file, runnable by extension (Windows) or mode (POSIX).
+        const found = which(name, { PATH: dir, PATHEXT: ext ? ext.toUpperCase() : '.EXE' }, platform);
+        if (found) {
+          out[name] = found;
+          break;
+        }
+      }
+    }
+    if (Object.keys(out).length === names.length) break;
+  }
+  return out;
 }
 
 export interface RunResult {

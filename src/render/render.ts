@@ -6,7 +6,7 @@ import type { InstallPlan } from '../install/plan.ts';
 import type { ApplyResult } from '../install/apply.ts';
 import { displayPath } from '../util/paths.ts';
 import { redactArgs, redactString } from '../util/redact.ts';
-import { colors, sanitize, sanitizeLine, type Colors } from '../util/text.ts';
+import { colors, sanitize, sanitizeLine, shellArg, type Colors } from '../util/text.ts';
 
 export type Format = 'text' | 'md' | 'json';
 
@@ -82,17 +82,17 @@ function list(s: Style, items: string[], indent = '  '): string {
   return items.map((i) => (s.md ? `- ${i}` : `${indent}- ${i}`)).join('\n');
 }
 
-function actionsFor(r: Recommendation, hosts: HostId[], s: Style): string[] {
+function actionsFor(r: Recommendation, hosts: HostId[], s: Style, pathArg = ''): string[] {
   const e = r.entry;
   const lines: string[] = [];
   const missing = hosts.filter((h) => r.availability[h]?.state !== 'configured' && r.availability[h]?.state !== 'incompatible');
   const host = missing[0] ?? hosts[0] ?? 'claude';
   const hostFlag = missing.length === 1 || hosts.length === 1 ? ` --host ${host}` : ' --host <claude|codex>';
   if (e.kind === 'mcp' && e.install) {
-    lines.push(`${code(s, `stackhint install ${e.id}${hostFlag}`)} - shows the exact change and asks before writing`);
-    lines.push(`${code(s, `stackhint try ${e.id}${hostFlag}`)} - one session without installing`);
+    lines.push(`${code(s, `stackhint install ${e.id}${hostFlag}${pathArg}`)} - shows the exact change and asks before writing`);
+    lines.push(`${code(s, `stackhint try ${e.id}${hostFlag}${pathArg}`)} - one session without installing`);
   } else if (e.kind === 'plugin' && e.hosts.claude.plugin) {
-    lines.push(`${code(s, `stackhint install ${e.id} --host claude`)} - runs \`claude plugin install ${e.hosts.claude.plugin}\` after you confirm`);
+    lines.push(`${code(s, `stackhint install ${e.id} --host claude${pathArg}`)} - runs \`claude plugin install ${e.hosts.claude.plugin}\` after you confirm`);
   } else {
     lines.push(`${code(s, `stackhint explain ${e.id}`)} - setup steps`);
   }
@@ -108,8 +108,10 @@ export function renderRecommendations(
   hosts: HostId[],
   recs: Recommendation[],
   available: Recommendation[],
-  opts: { showAvailable?: boolean; registryNote?: string } = {},
+  opts: { showAvailable?: boolean; registryNote?: string; projectArg?: string } = {},
 ): string {
+  // When the project was given as a path, the printed commands must name it too.
+  const pathArg = opts.projectArg ? ` ${shellArg(opts.projectArg)}` : '';
   const out: string[] = [];
   out.push(heading(s, `stackhint: tools for ${sanitizeLine(displayPath(ctx.root), 120)}`, 2));
   out.push(`Detected: ${stackSummary(ctx)}${ctx.task ? ` | task: "${t(s, ctx.task.text, 120)}"` : ''}`);
@@ -135,7 +137,7 @@ export function renderRecommendations(
     if (r.uncertainty.length) out.push(`${s.md ? '**Uncertain:**' : 'Uncertain:'} ${t(s, r.uncertainty.join('; '), 400)}`);
     if (r.alternatives.length) out.push(`${s.md ? '**Alternatives:**' : 'Alternatives:'} ${r.alternatives.join(', ')}`);
     out.push(s.md ? '**Actions:**' : 'Actions:');
-    out.push(list(s, actionsFor(r, hosts, s)));
+    out.push(list(s, actionsFor(r, hosts, s, pathArg)));
     out.push('');
   });
   if (opts.showAvailable !== false && available.length) {

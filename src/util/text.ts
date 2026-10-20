@@ -58,6 +58,15 @@ export function useColor(stream: NodeJS.WriteStream, env: NodeJS.ProcessEnv = pr
   return Boolean(stream.isTTY);
 }
 
+/**
+ * A path or word as a shell argument that works the same in PowerShell, cmd.exe and bash:
+ * plain when safe, otherwise in double quotes (backslashes stay literal in all three).
+ */
+export function shellArg(value: string): string {
+  if (/^[\w./:@=+-]+$/.test(value)) return value;
+  return /["$`]/.test(value) ? JSON.stringify(value) : `"${value}"`;
+}
+
 export function plural(n: number, one: string, many = one + 's'): string {
   return `${n} ${n === 1 ? one : many}`;
 }

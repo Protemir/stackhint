@@ -42,6 +42,9 @@ export function readText(p: string, maxBytes = 512 * 1024): string | undefined {
       read += n;
     }
     const slice = buf.subarray(0, read);
+    // UTF-16 with a BOM: Windows PowerShell 5.1 writes `pip freeze > requirements.txt` this way.
+    if (slice.length >= 2 && slice[0] === 0xff && slice[1] === 0xfe) return slice.subarray(2).toString('utf16le');
+    if (slice.length >= 2 && slice[0] === 0xfe && slice[1] === 0xff) return Buffer.from(slice.subarray(2)).swap16().toString('utf16le');
     if (slice.includes(0)) return undefined;
     let text = slice.toString('utf8');
     if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
@@ -51,6 +54,37 @@ export function readText(p: string, maxBytes = 512 * 1024): string | undefined {
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
   }
+}
+
+/** Raw bytes of a regular file, or undefined if missing, not a file or too big. */
+export function readBytes(p: string, maxBytes = 4 * 1024 * 1024): Buffer | undefined {
+  try {
+    const st = fs.statSync(p);
+    if (!st.isFile() || st.size > maxBytes) return undefined;
+    return fs.readFileSync(p);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A config file stackhint may edit. `text` has no BOM; `bom` says whether to put it back.
+ * Undefined when the bytes are not valid UTF-8: rewriting such a file would corrupt it.
+ */
+export function decodeConfig(bytes: Buffer): { text: string; bom: boolean } | undefined {
+  let text: string;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    return undefined;
+  }
+  if (text.includes('\0')) return undefined;
+  const bom = text.charCodeAt(0) === 0xfeff;
+  return { text: bom ? text.slice(1) : text, bom };
+}
+
+export function encodeConfig(text: string, bom: boolean): Buffer {
+  return Buffer.from((bom ? '﻿' : '') + text, 'utf8');
 }
 
 export type JsonResult<T> = { ok: true; value: T } | { ok: false; error: string; missing: boolean };
@@ -70,19 +104,39 @@ export function sha256(text: string | Buffer): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
-/** Write a file atomically: write a temp file next to it, then rename over the target. */
-export function writeAtomic(p: string, content: string): void {
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  const tmp = `${p}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+/**
+ * Write a file atomically: write a temp file next to it, then rename over the target.
+ * A symlinked file is written through (dotfile managers link ~/.codex/config.toml), and a
+ * file with several hard links is rewritten in place, so the link survives either way.
+ */
+export function writeAtomic(p: string, content: string | Buffer): void {
+  const data = typeof content === 'string' ? Buffer.from(content, 'utf8') : content;
+  let target = p;
+  try {
+    if (fs.lstatSync(p).isSymbolicLink()) target = fs.realpathSync(p);
+  } catch {
+    /* missing, or a dangling link: write at p */
+  }
+  try {
+    const st = fs.statSync(target);
+    if (st.isFile() && st.nlink > 1) {
+      fs.writeFileSync(target, data);
+      return;
+    }
+  } catch {
+    /* does not exist yet */
+  }
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const tmp = `${target}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
   try {
     let mode: number | undefined;
     try {
-      mode = fs.statSync(p).mode & 0o777;
+      mode = fs.statSync(target).mode & 0o777;
     } catch {
       mode = undefined;
     }
-    fs.writeFileSync(tmp, content, mode === undefined ? { encoding: 'utf8' } : { encoding: 'utf8', mode });
-    renameWithRetry(tmp, p);
+    fs.writeFileSync(tmp, data, mode === undefined ? {} : { mode });
+    renameWithRetry(tmp, target);
   } catch (e) {
     try {
       fs.rmSync(tmp, { force: true });

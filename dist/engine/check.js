@@ -175,6 +175,18 @@ export function looksReadOnly(s                  , ro            , rw           
   const serverArgs = CONTAINER_CLIS.test(base) ? s.args.slice(imageIndex(s.args) + 1 || s.args.length) : s.args;
   if (serverArgs.some((a) => /^--?(read-?only|readonly|disable-write)$|^--access-mode=restricted$/i.test(a))) return true;
   if (Object.entries(s.settings).some(([k, v]) => /read_?only/i.test(k) && /^(true|1)$/i.test(v))) return true;
+  // `docker run -e GITHUB_READ_ONLY=1 image` passes the server's settings as container env.
+  const containerEnv                         = {};
+  if (CONTAINER_CLIS.test(base)) {
+    const head = s.args.slice(0, imageIndex(s.args) >= 0 ? imageIndex(s.args) : s.args.length);
+    for (let i = 0; i < head.length; i++) {
+      const a = head[i]          ;
+      const pair = /^(-e|--env)$/.test(a) ? head[++i] : /^--env=/.test(a) ? a.slice(6) : /^-e[A-Za-z_]/.test(a) ? a.slice(2) : undefined;
+      const m = pair ? /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(pair) : null;
+      if (m && m[1]) containerEnv[m[1]] = m[2] ?? '';
+    }
+    if (Object.entries(containerEnv).some(([k, v]) => /read_?only/i.test(k) && /^(true|1)$/i.test(v))) return true;
+  }
   if (ro.url && rw.url && ro.url !== rw.url) {
     const marker = ro.url.replace(rw.url, '');
     return Boolean(s.url && marker && s.url.includes(marker.replace(/^[?&]/, '')));
@@ -182,7 +194,7 @@ export function looksReadOnly(s                  , ro            , rw           
   const roArgs = (ro.args ?? []).filter((a) => !(rw.args ?? []).includes(a));
   if (roArgs.some((a) => s.args.includes(a))) return true;
   for (const [k, v] of Object.entries(ro.env ?? {})) {
-    if (rw.env?.[k] !== v && s.settings[`env.${k}`] === v) return true;
+    if (rw.env?.[k] !== v && (s.settings[`env.${k}`] === v || containerEnv[k] === v)) return true;
   }
   for (const [k, v] of Object.entries(ro.headers ?? {})) {
     if (rw.headers?.[k] !== v && Object.entries(s.settings).some(([sk, sv]) => sk.toLowerCase() === `header.${k}`.toLowerCase() && sv === v)) return true;

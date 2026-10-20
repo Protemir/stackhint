@@ -244,7 +244,8 @@ describe('correctness review', () => {
     const supa = r.recommendations.find((x) => x.id === 'supabase');
     assert.ok(supa, 'Supabase should still be recommended');
     assert.equal(supa.action, 'install');
-    assert.match(supa.whyNow, /covers part of this/);
+    // A general Postgres server does not do what the Supabase server does (and vice versa).
+    assert.doesNotMatch(supa.whyNow, /You already have/);
   });
 
   it('task keywords avoid the false positives the review found', () => {
@@ -303,7 +304,8 @@ describe('correctness review', () => {
     const b = box({ '.env.example': 'CLICKHOUSE_HOST=abc.clickhouse.cloud\n', 'requirements.txt': 'clickhouse-connect\n' });
     const ctx = await analyzeProject(b.project, { git: NO_GIT });
     const ids = recommend(ctx, registry, readInventory(b.project, { env: b.env, which: fakeWhich({}) }), { hosts: ['claude'], platform: 'linux', minScore: 0 }).recommendations.map((x) => x.id);
-    assert.equal(ids.filter((i) => i.startsWith('clickhouse')).length, 1, ids.join());
+    // The two MCP servers; the ClickHouse skills plugin is a different kind of tool.
+    assert.equal(ids.filter((i) => i === 'clickhouse' || i === 'clickhouse-cloud').length, 1, ids.join());
   });
 
   it('internal reasons never count as new project signals', async () => {

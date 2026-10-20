@@ -1,6 +1,6 @@
 {
   "name": "stackhint",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Suggests MCP servers, plugins, skills and CLIs that fit your repo and task, checks the ones you already have, and installs only after you confirm.",
   "author": {
     "name": "Protemir",

@@ -1,6 +1,6 @@
 import type { Availability, ConfiguredServer, HostId, InstalledPlugin, Inventory, RegistryEntry } from '../types.ts';
 import { HOST_IDS } from '../types.ts';
-import { which } from '../util/exec.ts';
+import { whichMany } from '../util/exec.ts';
 import type { Env } from '../util/paths.ts';
 import { readClaudeInventory } from './claude.ts';
 import { readCodexInventory } from './codex.ts';
@@ -8,7 +8,7 @@ import { readCodexInventory } from './codex.ts';
 export const WATCHED_EXECUTABLES = [
   'claude', 'codex', 'git', 'gh', 'glab', 'az', 'aws', 'gcloud', 'kubectl', 'helm', 'docker', 'psql', 'node', 'npx',
   'uvx', 'uv', 'dnx', 'dotnet', 'semgrep', 'snyk', 'flux-operator-mcp', 'csharp-ls', 'typescript-language-server',
-  'pyright-langserver', 'gopls',
+  'pyright-langserver', 'gopls', 'heroku', 'fly', 'dart', 'xcrun',
 ];
 
 export interface InventoryOptions {
@@ -21,14 +21,15 @@ export interface InventoryOptions {
 export function readInventory(projectRoot: string, opts: InventoryOptions = {}): Inventory {
   const env = opts.env ?? process.env;
   const platform = opts.platform ?? process.platform;
-  const find = opts.which ?? ((n: string) => which(n, env, platform));
   const claude = readClaudeInventory(projectRoot, env, platform);
   const codex = readCodexInventory(projectRoot, env, platform);
-  const executables: Record<string, string> = {};
-  for (const name of WATCHED_EXECUTABLES) {
-    const p = find(name);
-    if (p) executables[name] = p;
-  }
+  let executables: Record<string, string> = {};
+  if (opts.which) {
+    for (const name of WATCHED_EXECUTABLES) {
+      const p = opts.which(name);
+      if (p) executables[name] = p;
+    }
+  } else executables = whichMany(WATCHED_EXECUTABLES, env, platform);
   const hostCli: Partial<Record<HostId, string>> = {};
   if (executables['claude']) hostCli.claude = executables['claude'];
   if (executables['codex']) hostCli.codex = executables['codex'];
@@ -50,11 +51,27 @@ export function serverMatchScore(entry: RegistryEntry, s: ConfiguredServer): num
   let best = 0;
   const url = (s.url ?? '').toLowerCase();
   const cmd = [s.command ?? '', ...s.args].join(' ').toLowerCase();
-  for (const u of entry.match.urls ?? []) if (url && url.includes(u.toLowerCase())) best = Math.max(best, 100 + u.length);
+  // URLs also count in arguments: bridges like `npx mcp-remote https://mcp.sentry.dev/mcp`.
+  for (const u of entry.match.urls ?? []) if (urlPatternIn(url, u) || urlPatternIn(cmd, u)) best = Math.max(best, 100 + u.length);
   for (const p of entry.match.packages ?? []) if (cmd && cmd.includes(p.toLowerCase())) best = Math.max(best, 100 + p.length);
   if (s.viaPlugin && (entry.match.plugins ?? []).some((p) => samePlugin(p, s.viaPlugin as string))) best = Math.max(best, 100);
   if (best === 0 && (entry.match.names ?? []).some((n) => n.toLowerCase() === s.name.toLowerCase())) best = 10;
   return best;
+}
+
+/**
+ * A registry URL pattern found in text. A pattern that starts with a host name must start the
+ * host too, so "mcp.cloudflare.com/mcp" does not match "docs.mcp.cloudflare.com/mcp".
+ * Patterns that start with "." (host suffix) or "/" (path on any host) match anywhere.
+ */
+export function urlPatternIn(text: string, pattern: string): boolean {
+  const p = pattern.toLowerCase();
+  if (!text || !p) return false;
+  const anchored = /^[a-z0-9]/.test(p);
+  for (let i = text.indexOf(p); i >= 0; i = text.indexOf(p, i + 1)) {
+    if (!anchored || i === 0 || !/[a-z0-9.-]/.test(text[i - 1] as string)) return true;
+  }
+  return false;
 }
 
 export function samePlugin(pattern: string, id: string): boolean {
@@ -92,7 +109,9 @@ export function availabilityFor(entry: RegistryEntry, inv: Inventory, host: Host
     return true;
   });
   const plugins: InstalledPlugin[] = inv.plugins.filter((p) => p.host === host && (entry.match.plugins ?? []).some((m) => samePlugin(m, p.id)));
-  const skills = inv.skills.filter((k) => k.host === host && (entry.match.skills ?? []).some((m) => m.toLowerCase() === k.name.toLowerCase()));
+  // "Write a project skill" is done once the project has skills of its own.
+  const projectSkills = entry.provides.includes('skill:custom') ? inv.skills.filter((k) => k.host === host && k.scope === 'project') : [];
+  const skills = [...projectSkills, ...inv.skills.filter((k) => k.host === host && (entry.match.skills ?? []).some((m) => m.toLowerCase() === k.name.toLowerCase()))];
   const executables = (entry.match.executables ?? []).filter((x) => inv.executables[x]);
 
   const enabledServers = servers.filter((s) => s.enabled);
@@ -105,6 +124,7 @@ export function availabilityFor(entry: RegistryEntry, inv: Inventory, host: Host
   }
   const enabledPlugin = plugins.find((p) => p.enabled);
   if (enabledPlugin) return { state: 'configured', detail: `plugin ${enabledPlugin.id} is enabled`, servers, plugins, skills, executables };
+  if (projectSkills.length > 0) return { state: 'configured', detail: `the project already has skills: ${[...new Set(projectSkills.map((k) => k.name))].slice(0, 3).join(', ')}`, servers, plugins, skills, executables };
   if (skills.length > 0) return { state: 'configured', detail: `skill "${(skills[0] as { name: string }).name}" is installed`, servers, plugins, skills, executables };
   if (enabledServers.length > 0) {
     const s = enabledServers[0] as ConfiguredServer;

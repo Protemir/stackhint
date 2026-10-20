@@ -52,6 +52,11 @@ export interface Dismissal {
   until?: string;
   /** Project key, or absent for all projects. */
   project?: string;
+  /**
+   * Every key the same project can show up under: the folder the command ran in, its git root
+   * and the folder a Claude Code session was opened in. Hooks and the CLI may see any of them.
+   */
+  projects?: string[];
   at: string;
   reason?: string;
 }
@@ -129,7 +134,11 @@ export class Store {
     const type = CONFIG_KEYS[key];
     if (!type) throw new Error(`unknown config key "${key}". Known: ${Object.keys(CONFIG_KEYS).join(', ')}`);
     let value: unknown = rawValue;
-    if (type === 'number') value = Number(rawValue);
+    if (type === 'number') {
+      // Number("") is 0: an empty or half-typed value must not silently become zero.
+      if (!/^\s*\d+(\.\d+)?\s*$/.test(rawValue)) throw new Error(`${key} must be a number`);
+      value = Number(rawValue);
+    }
     if (type === 'boolean') {
       if (!/^(true|false)$/.test(rawValue)) throw new Error(`${key} must be true or false`);
       value = rawValue === 'true';
@@ -137,7 +146,10 @@ export class Store {
     const err = validateConfigValue(key, value);
     if (err) throw new Error(`${key}: ${err}`);
     const res = readJson<Record<string, unknown>>(this.configPath);
-    const current = res.ok && res.value && typeof res.value === 'object' ? res.value : {};
+    // Never replace a config file we cannot read: the user would lose the other settings.
+    if (!res.ok && !res.missing) throw new Error(`${this.configPath}: ${res.error}; fix or delete it first`);
+    if (res.ok && (!res.value || typeof res.value !== 'object' || Array.isArray(res.value))) throw new Error(`${this.configPath} must hold a JSON object; fix or delete it first`);
+    const current = res.ok ? res.value : {};
     setPath(current, key, value);
     writeAtomic(this.configPath, JSON.stringify(current, null, 2) + '\n');
     return this.loadConfig().config;
@@ -147,18 +159,60 @@ export class Store {
 
   loadState(): State {
     const res = readJson<State>(this.statePath);
-    if (res.ok && res.value && typeof res.value === 'object' && res.value.version === 1) {
-      return {
-        version: 1,
-        dismissed: res.value.dismissed && typeof res.value.dismissed === 'object' ? res.value.dismissed : {},
-        projects: res.value.projects && typeof res.value.projects === 'object' ? res.value.projects : {},
-      };
-    }
+    if (res.ok && res.value && typeof res.value === 'object' && res.value.version === 1) return normalizeState(res.value);
     return { version: 1, dismissed: {}, projects: {} };
   }
 
   saveState(state: State): void {
     writeAtomic(this.statePath, JSON.stringify(state, null, 2) + '\n');
+  }
+
+  /**
+   * Read, change and write the state under a lock file, so hooks of parallel sessions and a
+   * `dismiss` in another terminal do not overwrite each other's changes.
+   */
+  updateState(change: (state: State) => void): State {
+    fs.mkdirSync(this.home, { recursive: true });
+    const lock = `${this.statePath}.lock`;
+    const deadline = Date.now() + 3000;
+    let fd: number | undefined;
+    for (;;) {
+      try {
+        fd = fs.openSync(lock, 'wx');
+        break;
+      } catch (e) {
+        // On Windows a lock file that another process is deleting gives EPERM or EACCES: busy, not broken.
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code !== 'EEXIST' && code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY') break; // cannot lock here: carry on without
+        try {
+          if (Date.now() - fs.statSync(lock).mtimeMs > 10_000) fs.rmSync(lock, { force: true }); // left by a killed process
+        } catch {
+          /* gone already */
+        }
+        if (Date.now() > deadline) break;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
+      }
+    }
+    try {
+      const res = readJson<State>(this.statePath);
+      // Keep a copy of a state file we cannot parse instead of silently dropping its dismissals.
+      if (!res.ok && !res.missing) {
+        try {
+          fs.copyFileSync(this.statePath, `${this.statePath}.corrupt`);
+        } catch {
+          /* best effort */
+        }
+      }
+      const state = this.loadState();
+      change(state);
+      this.saveState(state);
+      return state;
+    } finally {
+      if (fd !== undefined) {
+        fs.closeSync(fd);
+        fs.rmSync(lock, { force: true });
+      }
+    }
   }
 
   projectKey(root: string): string {
@@ -167,28 +221,32 @@ export class Store {
 
   isDismissed(state: State, id: string, projectKey: string): Dismissal | undefined {
     const now = this.now();
-    return (state.dismissed[id] ?? []).find((d) => (!d.project || d.project === projectKey) && (!d.until || Date.parse(d.until) > now));
+    const forProject = (d: Dismissal): boolean => (!d.project && !d.projects?.length) || d.project === projectKey || Boolean(d.projects?.includes(projectKey));
+    return (state.dismissed[id] ?? []).find((d) => forProject(d) && (!d.until || Date.parse(d.until) > now));
   }
 
-  dismiss(id: string, opts: { forMs?: number; projectKey?: string; reason?: string }): Dismissal {
-    const state = this.loadState();
+  dismiss(id: string, opts: { forMs?: number; projectKey?: string; projectKeys?: string[]; reason?: string }): Dismissal {
     const d: Dismissal = { at: new Date(this.now()).toISOString() };
     if (opts.forMs) d.until = new Date(this.now() + opts.forMs).toISOString();
     if (opts.projectKey) d.project = opts.projectKey;
+    const keys = [...new Set([...(opts.projectKey ? [opts.projectKey] : []), ...(opts.projectKeys ?? [])])];
+    if (keys.length > 1) d.projects = keys;
     if (opts.reason) d.reason = opts.reason.slice(0, 200);
-    const list = (state.dismissed[id] ?? []).filter((x) => (x.project ?? '') !== (d.project ?? ''));
-    list.push(d);
-    state.dismissed[id] = list;
-    this.saveState(state);
+    this.updateState((state) => {
+      const list = (state.dismissed[id] ?? []).filter((x) => (x.project ?? '') !== (d.project ?? ''));
+      list.push(d);
+      state.dismissed[id] = list;
+    });
     this.audit('dismiss', { id, ...d });
     return d;
   }
 
   undismiss(id: string): boolean {
-    const state = this.loadState();
-    const had = Boolean(state.dismissed[id]?.length);
-    delete state.dismissed[id];
-    this.saveState(state);
+    let had = false;
+    this.updateState((state) => {
+      had = Boolean(state.dismissed[id]?.length);
+      delete state.dismissed[id];
+    });
     if (had) this.audit('undismiss', { id });
     return had;
   }
@@ -230,6 +288,24 @@ export class Store {
       return [];
     }
   }
+}
+
+/** A state file someone edited by hand: keep what has the right shape, drop the rest. */
+function normalizeState(raw: State): State {
+  const obj = (v: unknown): v is Record<string, unknown> => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+  const str = (v: unknown): boolean => v === undefined || typeof v === 'string';
+  const dismissed: State['dismissed'] = {};
+  if (obj(raw.dismissed)) {
+    for (const [id, list] of Object.entries(raw.dismissed)) {
+      if (!Array.isArray(list)) continue;
+      const keys = (v: unknown): boolean => v === undefined || (Array.isArray(v) && v.every((k) => typeof k === 'string'));
+      const ok = list.filter((d): d is Dismissal => obj(d) && typeof d['at'] === 'string' && str(d['until']) && str(d['project']) && str(d['reason']) && keys(d['projects']));
+      if (ok.length) dismissed[id] = ok;
+    }
+  }
+  const projects: State['projects'] = {};
+  if (obj(raw.projects)) for (const [k, p] of Object.entries(raw.projects)) if (obj(p)) projects[k] = p as unknown as ProjectState;
+  return { version: 1, dismissed, projects };
 }
 
 function getPath(obj: Record<string, unknown>, key: string): unknown {

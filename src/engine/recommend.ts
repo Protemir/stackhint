@@ -13,7 +13,7 @@ import type {
   RegistryEntry,
   ScoreBreakdown,
 } from '../types.ts';
-import { availabilityFor, hostLabel, primaryEntryFor, serverMatchScore } from '../hosts/inventory.ts';
+import { availabilityFor, hostLabel, primaryEntryFor, serverMatchScore, urlPatternIn } from '../hosts/inventory.ts';
 import { isLegacy, isRetired } from '../registry/registry.ts';
 import { platformName } from '../util/paths.ts';
 
@@ -39,7 +39,12 @@ export interface RecommendResult {
   /** Relevant entries that are already set up (or covered by an equivalent tool). */
   alreadyAvailable: Recommendation[];
   suppressed: Suppressed[];
+  /** Group members folded into a better entry's alternatives (still explainable). */
+  folded: Recommendation[];
 }
+
+/** Signals from example and fixture folders are capped at this strength and never open a gate. */
+const SAMPLE_CAP = 0.3;
 
 const FREQ = { daily: 1, weekly: 0.7, occasional: 0.4 } as const;
 const EFFORT_COST = { low: 0.03, medium: 0.07, high: 0.15 } as const;
@@ -77,13 +82,13 @@ export function relevance(entry: RegistryEntry, ctx: ProjectContext): { value: n
   for (const [id, s] of Object.entries(ctx.signals)) {
     if (!id.startsWith('team-mcp:')) continue;
     const fp = id.slice('team-mcp:'.length);
-    const hit = [...(entry.match.urls ?? []), ...(entry.match.packages ?? [])].some((p) => fp.includes(p.toLowerCase()));
+    const hit = (entry.match.urls ?? []).some((u) => urlPatternIn(fp, u)) || (entry.match.packages ?? []).some((p) => fp.includes(p.toLowerCase()));
     if (!hit) continue;
     teamSignal = true;
     miss *= 1 - 0.8 * s.strength;
     reasons.push({ signal: 'team:other-client', strength: s.strength, weight: 0.8, evidence: s.evidence });
   }
-  const gated = entry.requiresAny ? !teamSignal && !entry.requiresAny.some((sig) => (ctx.signals[sig]?.strength ?? 0) > 0) : false;
+  const gated = entry.requiresAny ? !teamSignal && !entry.requiresAny.some((sig) => (ctx.signals[sig]?.strength ?? 0) > SAMPLE_CAP) : false;
   reasons.sort((a, b) => b.weight * b.strength - a.weight * a.strength);
   return { value: 1 - miss, reasons, gated };
 }
@@ -229,6 +234,8 @@ export function recommend(ctx: ProjectContext, registry: Registry, inv: Inventor
     const uncertainty: string[] = [];
     const top = rel.reasons[0];
     const maxStrength = Math.max(0, ...rel.reasons.map((r) => r.strength));
+    // A strong signal with a small weight (say, "uses GitHub" for a review plugin) is weak support.
+    const support = Math.max(0, ...rel.reasons.map((r) => r.strength * r.weight));
     for (const h of missingHosts) {
       const a = availability[h];
       if (a?.state === 'unknown') uncertainty.push(a.detail);
@@ -246,8 +253,8 @@ export function recommend(ctx: ProjectContext, registry: Registry, inv: Inventor
       if (a && a.servers.length > 0 && a.state !== 'configured') uncertainty.push(`${hostLabel(h)}: ${a.detail}`);
     }
     let confidence: Recommendation['confidence'] = 'low';
-    if (maxStrength >= 0.8 && uncertainty.length === 0) confidence = 'high';
-    else if (maxStrength >= 0.5 && uncertainty.length <= 2) confidence = 'medium';
+    if (maxStrength >= 0.8 && support >= 0.4 && uncertainty.length === 0) confidence = 'high';
+    else if (maxStrength >= 0.5 && support >= 0.2 && uncertainty.length <= 2) confidence = 'medium';
     uncertainty.push(...setupNotes);
 
     const breakdown: ScoreBreakdown = {
@@ -301,9 +308,11 @@ export function recommend(ctx: ProjectContext, registry: Registry, inv: Inventor
   recs.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
   const byGroup = new Map<string, Recommendation>();
   const kept: Recommendation[] = [];
+  const folded: Recommendation[] = [];
   for (const r of recs) {
     const g = r.entry.group;
-    if (!g) {
+    // A replacement for a retired server you use is specific advice; never fold it away.
+    if (!g || r.action === 'replace') {
       kept.push(r);
       continue;
     }
@@ -314,13 +323,14 @@ export function recommend(ctx: ProjectContext, registry: Registry, inv: Inventor
     } else {
       if (!lead.alternatives.includes(r.id)) lead.alternatives.push(r.id);
       suppressed.push({ id: r.id, reason: `alternative to ${lead.id}` });
+      folded.push(r);
     }
   }
   const order = { replace: 0, install: 1, consider: 1, 'use-existing': 2 } as const;
   kept.sort((a, b) => order[a.action] - order[b.action] || b.score - a.score || a.id.localeCompare(b.id));
   available.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
   const limit = opts.limit ?? 10;
-  return { recommendations: kept.slice(0, limit), alreadyAvailable: available, suppressed };
+  return { recommendations: kept.slice(0, limit), alreadyAvailable: available, suppressed, folded };
 }
 
 function evidenceText(r: Reason): string {
@@ -328,6 +338,9 @@ function evidenceText(r: Reason): string {
   if (!e) return r.signal;
   if (e.source === 'task') return e.detail.replace(/^task mentions/, 'your task mentions');
   if (e.source === 'git' || e.source === '.') return e.detail;
+  // "package.json (package.json)" says the same thing twice.
+  const base = e.source.split('/').pop() ?? e.source;
+  if (e.detail.toLowerCase() === base.toLowerCase()) return e.source;
   return `${e.detail} (${e.source})`;
 }
 
@@ -353,6 +366,8 @@ function whyNow(entry: RegistryEntry, reasons: Reason[], o: { legacyOverlap: str
 }
 
 function capitalize(s: string): string {
+  // File names keep their case: "package.json", not "Package.json".
+  if (/^[^\s;]*[./]/.test(s)) return s;
   return s ? s[0]?.toUpperCase() + s.slice(1) : s;
 }
 

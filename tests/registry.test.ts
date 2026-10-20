@@ -16,7 +16,7 @@ function producibleSignals(): Set<string> {
   const out = new Set<string>();
   for (const f of ['analyzer.ts', 'packages.ts', 'task.ts']) {
     const text = fs.readFileSync(path.join(REPO, 'src', 'context', f), 'utf8');
-    for (const m of text.matchAll(/['"]((?:lang|tech|db|orm|infra|cloud|vcs|ci|tracker|api|test|tool|quality|obs|payments|design|docs|workflow|task|agent):[a-z0-9.-]+)['"]/g)) out.add(m[1] as string);
+    for (const m of text.matchAll(/['"]((?:lang|tech|db|orm|infra|cloud|vcs|ci|tracker|api|test|tool|quality|obs|payments|design|docs|workflow|task|agent|ml):[a-z0-9.-]+)['"]/g)) out.add(m[1] as string);
   }
   return out;
 }

@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { readText } from '../util/fsx.js';
 import { relPath } from '../util/paths.js';
+import { redactString } from '../util/redact.js';
 import { readGit } from './git.js';
 import { CARGO, COMPOSER, GEMS, GO, IMAGES, MAVEN, NPM, NUGET, PYPI, matchPackage,                  } from './packages.js';
 import { SignalSet } from './signals.js';
@@ -34,6 +35,15 @@ const SKIP_DIRS = new Set([
   '.ruff_cache', '.cache', '.turbo', '.parcel-cache', 'Pods', 'DerivedData', '.dart_tool',
   'bower_components', 'jspm_packages', '.yarn', '.pnpm-store', '.claude', '.codex', '.agents',
   '.stackhint', 'TestResults', 'artifacts', '.serverless', '.aws-sam', '.vercel', '.wrangler',
+  'Intermediate', 'DerivedDataCache', '.netlify', 'htmlcov', '_site',
+]);
+
+/** Media, fonts, archives and binaries: no detector reads them, so they do not count against the file limit. */
+const ASSET_EXTS = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.bmp', '.ico', '.icns', '.tif', '.tiff', '.psd', '.xcf', '.blend', '.fbx',
+  '.glb', '.gltf', '.obj', '.mtl', '.ktx2', '.hdr', '.exr', '.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.opus', '.mp4',
+  '.webm', '.mov', '.avi', '.mkv', '.ttf', '.otf', '.woff', '.woff2', '.eot', '.zip', '.gz', '.tgz', '.7z', '.rar', '.tar',
+  '.exe', '.dll', '.so', '.dylib', '.pdb', '.class', '.jar', '.pyc', '.wasm', '.bin', '.dat', '.pdf', '.unity3d', '.asset',
 ]);
 
 /** Never read these, even if they match a detector. */
@@ -53,7 +63,7 @@ export async function analyzeProject(rootInput        , opts                 = {
   const set = new SignalSet();
   const warnings           = [];
   const maxFiles = opts.maxFiles ?? 25_000;
-  const maxDepth = opts.maxDepth ?? 10;
+  const maxDepth = opts.maxDepth ?? 14;
   const budget = opts.timeBudgetMs ?? 4_000;
 
   let st                      ;
@@ -73,11 +83,13 @@ export async function analyzeProject(rootInput        , opts                 = {
   }
 
   // ---- walk ----
+  // Breadth first, so a huge asset folder cannot crowd out the project files near the root.
   const files             = [];
   let truncated = false;
-  const stack                                        = [{ dir: root, depth: 0 }];
-  while (stack.length > 0) {
-    const { dir, depth } = stack.pop()                                  ;
+  let tooDeep = false;
+  const queue                                        = [{ dir: root, depth: 0 }];
+  for (let qi = 0; qi < queue.length; qi++) {
+    const { dir, depth } = queue[qi]                                  ;
     if (files.length >= maxFiles || Date.now() - started > budget) {
       truncated = true;
       break;
@@ -88,19 +100,24 @@ export async function analyzeProject(rootInput        , opts                 = {
     } catch {
       continue;
     }
+    // A Python virtual environment, whatever it is called.
+    if (depth > 0 && entries.some((e) => e.name === 'pyvenv.cfg' && e.isFile())) continue;
     for (const e of entries) {
       if (e.isSymbolicLink()) continue; // avoid loops and leaving the project
       const abs = path.join(dir, e.name);
       if (e.isDirectory()) {
         if (SKIP_DIRS.has(e.name)) continue;
-        if (e.name === 'env' && fs.existsSync(path.join(abs, 'pyvenv.cfg'))) continue;
-        if (depth + 1 <= maxDepth) stack.push({ dir: abs, depth: depth + 1 });
-        else truncated = true;
+        // Unity regenerates Library, Temp and Logs next to ProjectSettings; they hold huge caches.
+        if ((e.name === 'Library' || e.name === 'Temp' || e.name === 'Logs') && entries.some((x) => x.name === 'ProjectSettings' && x.isDirectory())) continue;
+        if (depth + 1 <= maxDepth) queue.push({ dir: abs, depth: depth + 1 });
+        else tooDeep = true;
         continue;
       }
       if (!e.isFile()) continue;
       const lower = e.name.toLowerCase();
-      files.push({ abs, rel: relPath(root, abs), name: e.name, lower, ext: path.extname(lower), dir });
+      const ext = path.extname(lower);
+      if (ASSET_EXTS.has(ext)) continue; // no detector reads media or binaries
+      files.push({ abs, rel: relPath(root, abs), name: e.name, lower, ext, dir });
       if (files.length >= maxFiles) {
         truncated = true;
         break;
@@ -108,15 +125,23 @@ export async function analyzeProject(rootInput        , opts                 = {
     }
   }
   if (truncated) warnings.push('project is large; the scan stopped early and may miss some signals');
+  else if (tooDeep) warnings.push(`folders deeper than ${maxDepth} levels were not scanned`);
 
   // ---- reading with budget ----
   let filesRead = 0;
   let bytesRead = 0;
   const READ_FILES = 1500;
   const READ_BYTES = 24 * 1024 * 1024;
+  // Reading gets the rest of the time budget plus half of it again, then stops: hooks must stay fast.
+  const readDeadline = started + budget * 1.5;
+  let readCut = false;
   const read = (f          , max = 256 * 1024)                     => {
     if (isSecretFile(f.name)) return undefined;
     if (filesRead >= READ_FILES || bytesRead >= READ_BYTES) return undefined;
+    if (Date.now() > readDeadline) {
+      readCut = true;
+      return undefined;
+    }
     const t = readText(f.abs, max);
     if (t === undefined) return undefined;
     filesRead++;
@@ -130,21 +155,27 @@ export async function analyzeProject(rootInput        , opts                 = {
 
   // ---- language by extension (sample and fixture folders do not count) ----
   const extCount = new Map                ();
-  for (const f of files) if (!isSampleDir(f.rel)) extCount.set(f.ext, (extCount.get(f.ext) ?? 0) + 1);
+  for (const f of files) {
+    if (isSampleDir(f.rel) || f.lower.endsWith('.gradle.kts')) continue; // build scripts are not Kotlin code
+    extCount.set(f.ext, (extCount.get(f.ext) ?? 0) + 1);
+  }
   const LANGS                            = [
     ['lang:csharp', ['.cs']],
     ['lang:fsharp', ['.fs']],
     ['lang:typescript', ['.ts', '.tsx', '.mts', '.cts']],
     ['lang:javascript', ['.js', '.jsx', '.mjs', '.cjs']],
-    ['lang:python', ['.py']],
+    ['lang:python', ['.py', '.pyi']],
     ['lang:go', ['.go']],
     ['lang:rust', ['.rs']],
     ['lang:java', ['.java']],
     ['lang:kotlin', ['.kt', '.kts']],
     ['lang:php', ['.php']],
-    ['lang:ruby', ['.rb']],
+    ['lang:ruby', ['.rb', '.rake', '.gemspec', '.ru', '.erb']],
     ['lang:swift', ['.swift']],
-    ['lang:cpp', ['.c', '.cc', '.cpp', '.h', '.hpp']],
+    ['lang:cpp', ['.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.hxx']],
+    ['lang:dart', ['.dart']],
+    ['lang:lua', ['.lua']],
+    ['lang:liquid', ['.liquid']],
   ];
   for (const [id, exts] of LANGS) {
     const n = exts.reduce((acc, e) => acc + (extCount.get(e) ?? 0), 0);
@@ -158,6 +189,13 @@ export async function analyzeProject(rootInput        , opts                 = {
   const htmlFiles = (extCount.get('.html') ?? 0) + (extCount.get('.htm') ?? 0);
   const styleOrScript = ['.css', '.scss', '.js', '.mjs'].reduce((acc, e) => acc + (extCount.get(e) ?? 0), 0);
   if (htmlFiles >= 3 && styleOrScript >= 1) set.add('tech:frontend', 0.6, { source: '.', detail: `${htmlFiles} HTML pages` });
+  // Component files of frameworks that have their own MCP servers.
+  const svelteFiles = extCount.get('.svelte') ?? 0;
+  if (svelteFiles >= 3) set.add('tech:svelte', 0.7, { source: '.', detail: String(svelteFiles) + ' .svelte files' });
+  const astroFiles = extCount.get('.astro') ?? 0;
+  if (astroFiles >= 3) set.add('tech:astro', 0.7, { source: '.', detail: String(astroFiles) + ' .astro files' });
+  const unityFiles = (extCount.get('.unity') ?? 0) + (extCount.get('.asmdef') ?? 0);
+  if (unityFiles >= 1) set.add('tech:unity', 0.7, { source: '.', detail: String(unityFiles) + ' Unity scenes or assembly definitions' });
 
   const applyPackages = (target            , f          , rules               , names                  , kind        )       => {
     for (const name of names) {
@@ -181,6 +219,8 @@ export async function analyzeProject(rootInput        , opts                 = {
     const relLower = f.rel.toLowerCase();
     const migrationDir = sample ? undefined : migrationGroup(f.rel);
     if (migrationDir) bump(migrationDirs, migrationDir);
+    // Additive and first, so the early `continue`s below (.cs, manifest.json...) cannot skip it.
+    detectPlatformFiles(f, n, relLower, target, read);
 
     // .NET
     if (f.ext === '.csproj' || f.ext === '.fsproj' || f.ext === '.vbproj') {
@@ -237,8 +277,27 @@ export async function analyzeProject(rootInput        , opts                 = {
           if (deps && typeof deps === 'object') for (const d of Object.keys(deps          )) names.add(d);
         }
         applyPackages(target, f, NPM, names, 'dependency');
+        const scripts = pkg['scripts'];
+        const testScript = scripts && typeof scripts === 'object' ? (scripts                           )['test'] : undefined;
+        if (typeof testScript === 'string' && /\b(node|bun|deno) (--test|test)\b|\btsx --test\b/.test(testScript)) target.add('test:unit', 0.8, ev(f, 'test script runs node --test'));
       } catch {
         warnings.push(`could not parse ${f.rel}`);
+      }
+      continue;
+    }
+    // A page that loads scripts near the root: a static site or a browser game without a bundler.
+    // Only where a site's entry page lives: generated reports (htmlcov/index.html) are not a frontend.
+    if (n === 'index.html' && /^((public|src|static|www|web|app|client|frontend)\/)?index\.html$/.test(relLower)) {
+      const t = read(f, 256 * 1024);
+      if (t && /<script\b/i.test(t)) target.add('tech:frontend', 0.6, ev(f, 'page with scripts'));
+      continue;
+    }
+    // Browser extension manifest (Chrome, Edge, Firefox).
+    if (n === 'manifest.json' && f.rel.split('/').length <= 3) {
+      const t = read(f, 256 * 1024);
+      if (t && /"manifest_version"\s*:\s*[23]\b/.test(t) && /"(background|content_scripts|action|browser_action|permissions)"/.test(t)) {
+        target.add('tech:browser-extension', 0.9, ev(f, 'browser extension manifest'));
+        target.add('tech:frontend', 0.6, ev(f, 'browser extension manifest'));
       }
       continue;
     }
@@ -271,7 +330,7 @@ export async function analyzeProject(rootInput        , opts                 = {
     }
 
     // Python
-    if (/^requirements[\w.-]*\.txt$/.test(n) || n === 'constraints.txt') {
+    if (/^requirements[\w.-]*\.txt$/.test(n) || n === 'constraints.txt' || (f.ext === '.txt' && /(^|\/)requirements\/[^/]+$/.test(relLower))) {
       target.add('lang:python', 0.85, ev(f, f.name));
       const t = read(f);
       if (t) applyPackages(target, f, PYPI, pythonRequirements(t), 'requirement');
@@ -302,8 +361,9 @@ export async function analyzeProject(rootInput        , opts                 = {
       if (t) applyPackages(target, f, CARGO, cargoDeps(t), 'crate');
       continue;
     }
-    if (n === 'pom.xml' || n === 'build.gradle' || n === 'build.gradle.kts') {
-      target.add(n.endsWith('.kts') ? 'lang:kotlin' : 'lang:java', 0.85, ev(f, f.name));
+    if (n === 'pom.xml' || n === 'build.gradle' || n === 'build.gradle.kts' || n === 'libs.versions.toml') {
+      // The Kotlin DSL is common in Java projects too: the source files decide the language.
+      if (n === 'pom.xml' || n === 'build.gradle') target.add('lang:java', 0.85, ev(f, f.name));
       const t = read(f);
       if (t) applyPackages(target, f, MAVEN, jvmCoordinates(t), 'artifact');
       continue;
@@ -343,7 +403,8 @@ export async function analyzeProject(rootInput        , opts                 = {
       const t = read(f);
       if (t) {
         for (const m of t.matchAll(/^[ \t]*image:[ \t]*["']?([^\s"'#]{1,200})/gm)) {
-          const image = (m[1]          ).toLowerCase();
+          // ${REDIS_IMAGE:-redis:7} -> redis:7
+          const image = (m[1]          ).toLowerCase().replace(/^\$\{[a-z0-9_]{1,80}:?-([^}]{1,150})\}$/, '$1');
           const bare = image.replace(/[:@].*$/, '');
           for (const [re, sigs] of IMAGES) {
             if (re.test(bare)) for (const [id, s] of sigs) target.add(id, s, ev(f, `service image ${image}`));
@@ -549,6 +610,8 @@ export async function analyzeProject(rootInput        , opts                 = {
     }
   }
 
+  if (readCut) warnings.push('the scan ran out of time and did not read every config file');
+
   // Examples describe other projects: however many files they have, they stay weak evidence.
   for (const sig of Object.values(sampleSet.toRecord())) {
     const first = sig.evidence[0];
@@ -636,8 +699,9 @@ export function migrationGroup(rel        )                     {
 
 // ---------- manifest parsers ----------
 
-export function nugetPackages(xml        )           {
+export function nugetPackages(rawXml        )           {
   const out = new Set        ();
+  const xml = rawXml.replace(/<!--[\s\S]*?-->/g, ' ');
   for (const m of xml.matchAll(/<Package(?:Reference|Version)\b[^>]{0,300}?\bInclude\s{0,5}=\s{0,5}"([^"]{1,200})"/gi)) out.add(m[1]          );
   for (const m of xml.matchAll(/<package\b[^>]{0,300}?\bid\s{0,5}=\s{0,5}"([^"]{1,200})"/gi)) out.add(m[1]          );
   return [...out];
@@ -727,6 +791,12 @@ export function pythonManifestNames(rawText        , fileName = 'pyproject.toml'
       for (const r of quotedRequirements(value)) out.add(r);
     } else if (section === 'project.optional-dependencies' || section === 'dependency-groups') {
       for (const r of quotedRequirements(value)) out.add(r);
+    } else if (/^tool\.(uv|rye)$/.test(section) && key === 'dev-dependencies') {
+      for (const r of quotedRequirements(value)) out.add(r);
+    } else if (isDepTable && value.trimStart().startsWith('[') && !value.includes('{')) {
+      // A named group of requirements ([tool.pdm.dev-dependencies] lint = ["ruff"]): the key is the group.
+      // Poetry's multiple constraints (django = [{version = "<4"}, ...]) have tables and fall through.
+      for (const r of quotedRequirements(value)) out.add(r);
     } else if (isDepTable && key !== 'python') {
       out.add(normalizePy(key));
     }
@@ -769,6 +839,8 @@ function normalizePy(name        )         {
 export function goModules(text        )           {
   const out           = [];
   for (const raw of text.split(/\r?\n/)) {
+    // Indirect requirements are other modules' dependencies, not this project's choices.
+    if (/\/\/\s*indirect\b/.test(raw)) continue;
     const parts = raw.trim().replace(/^require\s+/, '').split(/\s+/);
     const mod = parts[0] ?? '';
     if (mod.length <= 200 && /^[a-z0-9.-]{1,100}\.[a-z]{2,20}\/\S+$/i.test(mod) && /^v\d/.test(parts[1] ?? '')) out.push(mod);
@@ -803,8 +875,10 @@ export function jvmCoordinates(text        )           {
   for (const m of t.matchAll(/<groupId> ?([^<\s]{1,200}) ?<\/groupId>\s{0,20}<artifactId> ?([^<\s]{1,200}) ?<\/artifactId>/g)) {
     out.add(`${m[1]}:${m[2]}`);
   }
-  // Gradle: "group:artifact:version" strings
+  // Gradle: "group:artifact:version" strings (also `module = "g:a"` in libs.versions.toml)
   for (const m of t.matchAll(/["']([A-Za-z0-9_.-]{1,100}):([A-Za-z0-9_.-]{1,100})(?::[^"'\n]{0,100})?["']/g)) out.add(`${m[1]}:${m[2]}`);
+  // Version catalogs: { group = "g", name = "a" }
+  for (const m of t.matchAll(/\bgroup ?= ?"([A-Za-z0-9_.-]{1,100})" ?, ?name ?= ?"([A-Za-z0-9_.-]{1,100})"/g)) out.add(`${m[1]}:${m[2]}`);
   return [...out];
 }
 
@@ -896,6 +970,87 @@ function stripJsonComments(text        )         {
   return out.replace(/,(\s{0,200}[}\]])/g, '$1');
 }
 
+/**
+ * Config files of hosting platforms, frameworks and engines. Additive: other detectors still
+ * see the file. Files are read only when the name alone is not enough.
+ */
+function detectPlatformFiles(f          , n        , relLower        , set            , read                                                   )       {
+  const add = (id        , strength        , detail        )       => set.add(id, strength, { source: f.rel, detail });
+  const atRoot = !relLower.includes('/');
+  // Observability agents
+  if (n === 'datadog.yaml' || n === 'datadog-ci.json') add('obs:datadog', 0.8, 'Datadog config');
+  if (/^newrelic\.(js|cjs|ini|yml|yaml)$/.test(n)) add('obs:newrelic', 0.85, 'New Relic agent config');
+  // Hosting platforms
+  if (n === 'netlify.toml') add('cloud:netlify', 0.95, 'Netlify config');
+  if (/(^|\/)netlify\/(edge-)?functions\//.test(relLower)) add('cloud:netlify', 0.85, 'Netlify functions');
+  if (n === 'heroku.yml') add('cloud:heroku', 0.95, 'Heroku build manifest');
+  if (n === 'procfile' && atRoot) add('cloud:heroku', 0.4, 'Procfile');
+  if ((n === 'render.yaml' || n === 'render.yml') && atRoot) add('cloud:render', 0.95, 'Render Blueprint');
+  if (n === 'railway.json' || n === 'railway.toml') add('cloud:railway', 0.95, 'Railway config');
+  if (n === 'fly.toml') add('cloud:fly', 0.95, 'Fly.io app config');
+  if (n === 'pulumi.yaml' || n === 'pulumi.yml') add('infra:pulumi', 0.95, 'Pulumi project');
+  else if (/^pulumi\.[\w-]{1,60}\.ya?ml$/.test(n)) add('infra:pulumi', 0.9, 'Pulumi stack config');
+  if (/(^|\/)\.do\/(app|deploy\.template)\.yaml$/.test(relLower)) add('cloud:digitalocean', 0.95, 'DigitalOcean App Platform spec');
+  if (n === '.pscale.yml') add('db:planetscale', 0.9, 'PlanetScale CLI config');
+  // Content, chat and frameworks
+  if (/^sanity\.(config|cli)\.(ts|js|tsx|jsx|mjs)$/.test(n)) add('tech:sanity', 0.95, 'Sanity Studio config');
+  if (n === 'slack.json' && atRoot) add('tool:slack', 0.6, 'Slack CLI app');
+  if (n === 'angular.json') add('tech:angular', 0.95, 'Angular workspace');
+  if (/^svelte\.config\.(js|ts|mjs|cjs)$/.test(n)) add('tech:svelte', 0.9, 'Svelte config');
+  if (n === 'nx.json') add('tool:nx', 0.95, 'Nx workspace');
+  if (/^shopify\.app(\.[\w-]{1,60})?\.toml$/.test(n)) add('tech:shopify', 0.95, 'Shopify app config');
+  if (n === 'shopify.extension.toml') add('tech:shopify', 0.9, 'Shopify app extension');
+  if (/(^|\/)layout\/theme\.liquid$/.test(relLower)) {
+    add('tech:shopify', 0.95, 'Shopify theme');
+    add('lang:liquid', 0.9, 'Shopify theme');
+  }
+  if (n === 'eas.json') add('tech:expo', 0.9, 'Expo Application Services config');
+  if (relLower === 'artisan') add('tech:laravel', 0.85, 'Laravel artisan');
+  if (/(^|\/)\.storybook\/main\.(ts|js|mjs|cjs|mts)$/.test(relLower)) add('tool:storybook', 0.95, 'Storybook config');
+  if (/^astro\.config\.(mjs|js|ts|mts|cjs)$/.test(n)) add('tech:astro', 0.95, 'Astro config');
+  if (/^nuxt\.config\.(ts|js|mjs)$/.test(n)) add('tech:nuxt', 0.95, 'Nuxt config');
+  if (/(^|\/)\.claude-plugin\/(plugin|marketplace)\.json$/.test(relLower)) add('tech:claude-plugin', 0.9, 'Claude Code plugin manifest');
+  // Mobile, desktop and game engines
+  if (n === 'pubspec.yaml') {
+    add('lang:dart', 0.95, 'pubspec.yaml');
+    const t = read(f, 128 * 1024);
+    if (t && /^[ \t]*flutter:[ \t]*\r?\n[ \t]+sdk:[ \t]*flutter\b/m.test(t)) add('tech:flutter', 0.95, 'Flutter app');
+  }
+  if (n === 'project.pbxproj' && /\.xcodeproj$/i.test(f.dir)) add('tech:xcode', 0.95, 'Xcode project');
+  if (n === 'contents.xcworkspacedata' && /\.xcworkspace$/i.test(f.dir)) add('tech:xcode', 0.9, 'Xcode workspace');
+  if (n === 'package.swift') {
+    add('lang:swift', 0.9, 'Swift package');
+    add('tech:xcode', 0.4, 'Swift package');
+  }
+  if (/(^|\/)projectsettings\/projectversion\.txt$/.test(relLower)) add('tech:unity', 0.95, 'Unity project');
+  if (/(^|\/)packages\/manifest\.json$/.test(relLower)) {
+    const t = read(f, 256 * 1024);
+    if (t && t.includes('"com.unity.')) add('tech:unity', 0.9, 'Unity package manifest');
+  }
+  if (f.ext === '.uproject') add('tech:unreal', 0.95, 'Unreal project');
+  if (/\.(build|target)\.cs$/.test(n)) add('tech:unreal', 0.85, 'Unreal build rules');
+  if (f.ext === '.uplugin') add('tech:unreal', 0.8, 'Unreal plugin');
+  // Build tooling
+  if (n === 'settings.gradle' || n === 'settings.gradle.kts') {
+    const t = read(f, 128 * 1024);
+    if (t && /com\.gradle\.(develocity|enterprise)/.test(t)) add('tool:develocity', 0.95, 'Develocity plugin');
+  }
+  if (/(^|\/)\.mvn\/extensions\.xml$/.test(relLower)) {
+    const t = read(f, 128 * 1024);
+    if (t && /(develocity|gradle-enterprise)-maven-extension/.test(t)) add('tool:develocity', 0.95, 'Develocity Maven extension');
+  }
+  if (n === 'components.json') {
+    const t = read(f, 64 * 1024);
+    if (t && t.includes('ui.shadcn.com/schema')) add('tool:shadcn', 0.95, 'shadcn/ui config');
+    else if (t && /"aliases"/.test(t) && /"tailwind"/.test(t)) add('tool:shadcn', 0.8, 'shadcn/ui config');
+  }
+  if (n === 'app.json' && relLower.split('/').length <= 2) {
+    const t = read(f, 128 * 1024);
+    if (t && /^\s*\{\s*"expo"\s*:/.test(t)) add('tech:expo', 0.85, 'Expo app config');
+    if (t && /"buildpacks"\s*:/.test(t)) add('cloud:heroku', 0.7, 'Heroku app.json');
+  }
+}
+
 function detectEnvExample(f          , text        , set            )       {
   const KEYS                                  = [
     [/^(POSTGRES_|PG(HOST|USER|DATABASE|PASSWORD|PORT)\b)/, 'db:postgres', 0.6],
@@ -923,6 +1078,34 @@ function detectEnvExample(f          , text        , set            )       {
     [/^POSTMAN_/, 'api:postman', 0.6],
     [/^SONAR/, 'quality:sonar', 0.6],
     [/^ARGOCD_/, 'infra:argocd', 0.6],
+    [/^DD_(API_KEY|APP_KEY|APPLICATION_KEY|SITE)$/, 'obs:datadog', 0.6],
+    [/^NEW_RELIC_/, 'obs:newrelic', 0.65],
+    [/^HONEYCOMB_/, 'obs:honeycomb', 0.7],
+    [/^PAGERDUTY_/, 'obs:pagerduty', 0.6],
+    [/^(DYNATRACE_|DT_API_TOKEN$|DT_ENVIRONMENT$|DT_PLATFORM_TOKEN$)/, 'obs:dynatrace', 0.6],
+    [/^(NEXT_PUBLIC_|VITE_)?POSTHOG_/, 'obs:posthog', 0.75],
+    [/^NETLIFY_/, 'cloud:netlify', 0.6],
+    [/^HEROKU_/, 'cloud:heroku', 0.6],
+    [/^RENDER_(API_KEY|SERVICE_ID)$/, 'cloud:render', 0.6],
+    [/^RAILWAY_/, 'cloud:railway', 0.6],
+    [/^FLY_(API|ACCESS)_TOKEN$/, 'cloud:fly', 0.6],
+    [/^PULUMI_/, 'infra:pulumi', 0.6],
+    [/^(DIGITALOCEAN_|DO_API_TOKEN$)/, 'cloud:digitalocean', 0.6],
+    [/^PLANETSCALE_/, 'db:planetscale', 0.75],
+    [/^TURSO_/, 'db:turso', 0.8],
+    [/^UPSTASH_/, 'db:upstash', 0.8],
+    [/^(NEXT_PUBLIC_|VITE_)?ALGOLIA_/, 'db:algolia', 0.75],
+    [/^(NEXT_PUBLIC_)?CONTENTFUL_/, 'tech:contentful', 0.75],
+    [/^(NEXT_PUBLIC_|SANITY_STUDIO_)?SANITY_/, 'tech:sanity', 0.75],
+    [/^SLACK_/, 'tool:slack', 0.55],
+    [/^(NEXT_PUBLIC_)?AUTH0_/, 'tech:auth0', 0.8],
+    [/^(NEXT_PUBLIC_|VITE_)?CLERK_/, 'tech:clerk', 0.8],
+    [/^TWILIO_/, 'api:twilio', 0.75],
+    [/^RESEND_/, 'api:resend', 0.75],
+    [/^ASANA_/, 'tracker:asana', 0.6],
+    [/^MONDAY_/, 'tracker:monday', 0.5],
+    [/^CLICKUP_/, 'tracker:clickup', 0.6],
+    [/^(HF_TOKEN|HUGGING_?FACE_)/, 'ml:huggingface', 0.6],
   ];
   for (const raw of text.split(/\r?\n/)) {
     const m = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]{0,100})[ \t]*=[ \t]*(.*)$/.exec(raw.slice(0, 2000));
@@ -940,6 +1123,17 @@ function detectEnvExample(f          , text        , set            )       {
     if (/\bneon\.tech\b/i.test(value)) set.add('db:neon', 0.85, { source: f.rel, detail: `${key} points at Neon` });
     if (/\bclickhouse\.cloud\b/i.test(value)) set.add('db:clickhouse-cloud', 0.85, { source: f.rel, detail: `${key} points at ClickHouse Cloud` });
     if (/\batlassian\.net\b/i.test(value)) set.add('tracker:jira', 0.75, { source: f.rel, detail: `${key} points at Atlassian Cloud` });
+    const HOSTS                                          = [
+      [/\bdatadoghq\.(com|eu)\b/i, 'obs:datadog', 0.8, 'Datadog'],
+      [/\bhoneycomb\.io\b/i, 'obs:honeycomb', 0.85, 'Honeycomb'],
+      [/\.(live|apps)\.dynatrace\.com\b/i, 'obs:dynatrace', 0.85, 'Dynatrace'],
+      [/\bposthog\.com\b/i, 'obs:posthog', 0.8, 'PostHog'],
+      [/\bpsdb\.cloud\b/i, 'db:planetscale', 0.85, 'PlanetScale'],
+      [/^libsql:\/\/[^\s]{1,200}\.turso\.io\b/i, 'db:turso', 0.9, 'Turso'],
+      [/\bupstash\.io\b/i, 'db:upstash', 0.85, 'Upstash'],
+      [/\.auth0\.com\b/i, 'tech:auth0', 0.85, 'Auth0'],
+    ];
+    for (const [re, id, strength, label] of HOSTS) if (re.test(value)) set.add(id, strength, { source: f.rel, detail: key + ' points at ' + label });
   }
 }
 
@@ -962,6 +1156,9 @@ function detectTrackerLinks(f          , text        , set            , base    
   once(/\bdev\.azure\.com\//i, 'vcs:azure-repos', 0.5, () => 'links to Azure DevOps');
   once(/\bsentry\.io\/(organizations|issues)\//i, 'obs:sentry', 0.5, () => 'links to Sentry');
   once(/\b(app\.)?getpostman\.com\/|\bpostman\.com\/[a-z0-9-]{1,64}\/workspace\//i, 'api:postman', 0.6, () => 'links to Postman');
+  once(/\bapp\.asana\.com\/0\//i, 'tracker:asana', 0.8, () => 'links to Asana tasks');
+  once(/\b[a-z0-9-]{1,63}\.monday\.com\/boards\//i, 'tracker:monday', 0.8, () => 'links to monday.com boards');
+  once(/\bapp\.clickup\.com\/t\//i, 'tracker:clickup', 0.8, () => 'links to ClickUp tasks');
 }
 
 function detectCiContent(f          , text        , set            )       {
@@ -983,6 +1180,17 @@ function detectCiContent(f          , text        , set            )       {
   add(/\bdotnet (test|build|publish)\b|actions\/setup-dotnet|UseDotNet@/, 'tech:dotnet', 0.6, 'CI builds .NET');
   add(/getsentry\/action-release|sentry-cli/, 'obs:sentry', 0.7, 'CI creates Sentry releases');
   add(/playwright (test|install)/, 'test:e2e', 0.8, 'CI runs Playwright');
+  add(/\bDataDog\/|\bdatadog-ci\b/, 'obs:datadog', 0.7, 'CI reports to Datadog');
+  add(/newrelic\/deployment-marker-action/, 'obs:newrelic', 0.75, 'CI marks New Relic deployments');
+  add(/\bnetlify deploy\b|nwtgck\/actions-netlify/, 'cloud:netlify', 0.75, 'CI deploys to Netlify');
+  add(/heroku container:|git push heroku|akhileshns\/heroku-deploy/, 'cloud:heroku', 0.75, 'CI deploys to Heroku');
+  add(/api\.render\.com\/deploy\/srv-/, 'cloud:render', 0.75, 'CI triggers a Render deploy');
+  add(/\brailway (up|deploy)\b|railwayapp\/cli/, 'cloud:railway', 0.75, 'CI deploys to Railway');
+  add(/superfly\/flyctl-actions|\bfly(ctl)? deploy\b/, 'cloud:fly', 0.8, 'CI deploys to Fly.io');
+  add(/pulumi\/actions|\bpulumi (up|preview)\b/, 'infra:pulumi', 0.8, 'CI runs Pulumi');
+  add(/digitalocean\/action-doctl|\bdoctl apps\b/, 'cloud:digitalocean', 0.8, 'CI deploys to DigitalOcean');
+  add(/\bpscale deploy-request\b|planetscale\/[\w-]{1,60}-action/, 'db:planetscale', 0.8, 'CI uses PlanetScale');
+  add(/slackapi\/slack-github-action|8398a7\/action-slack/, 'tool:slack', 0.6, 'CI posts to Slack');
 }
 
 function detectTerraformProviders(f          , text        , set            )       {
@@ -995,6 +1203,18 @@ function detectTerraformProviders(f          , text        , set            )   
     [/(provider\s+"helm"|hashicorp\/helm)/, 'infra:helm', 0.5],
     [/vercel\/vercel/, 'cloud:vercel', 0.8],
     [/(provider\s+"grafana"|grafana\/grafana)/, 'obs:grafana', 0.6],
+    [/datadog\/datadog/i, 'obs:datadog', 0.85],
+    [/newrelic\/newrelic/i, 'obs:newrelic', 0.85],
+    [/honeycombio\/honeycombio/i, 'obs:honeycomb', 0.85],
+    [/pagerduty\/pagerduty/i, 'obs:pagerduty', 0.85],
+    [/dynatrace-oss\/dynatrace/i, 'obs:dynatrace', 0.85],
+    [/netlify\/netlify/i, 'cloud:netlify', 0.85],
+    [/heroku\/heroku/i, 'cloud:heroku', 0.85],
+    [/render-oss\/render/i, 'cloud:render', 0.85],
+    [/digitalocean\/digitalocean/i, 'cloud:digitalocean', 0.85],
+    [/planetscale\/planetscale/i, 'db:planetscale', 0.85],
+    [/upstash\/upstash/i, 'db:upstash', 0.85],
+    [/auth0\/auth0/i, 'tech:auth0', 0.85],
   ];
   for (const [re, id, s] of P) if (re.test(text)) set.add(id, s, { source: f.rel, detail: 'Terraform provider' });
 }
@@ -1020,12 +1240,34 @@ function detectOtherClientConfigs(root        , set           )       {
       if (!def || typeof def !== 'object') continue;
       const d = def                           ;
       const fingerprint = [name, d['url'], d['command'], ...(Array.isArray(d['args']) ? d['args'] : [])]
-        .filter((x) => typeof x === 'string')
+        .filter((x)              => typeof x === 'string')
+        .map(fingerprintToken)
+        .filter(Boolean)
         .join(' ')
         .toLowerCase();
-      set.add('team-mcp:' + fingerprintKey(fingerprint), 0.8, { source: rel, detail: `team configured MCP server "${name}" for another client` });
+      set.add('team-mcp:' + fingerprintKey(fingerprint), 0.8, { source: rel, detail: `team configured MCP server "${name.slice(0, 60)}" for another client` });
     }
   }
+}
+
+/**
+ * Only what registry patterns can match goes into a fingerprint: a URL's host and path, and
+ * package-like words. Passwords in connection strings, tokens in query strings and flag values
+ * stay out, because signal ids are printed by `scan --format json`.
+ */
+function fingerprintToken(raw        )         {
+  const t = raw.trim();
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t)) {
+    try {
+      const u = new URL(t);
+      return /^https?:$/.test(u.protocol) ? `${u.host}${u.pathname}` : '';
+    } catch {
+      return '';
+    }
+  }
+  // Package names and image refs (an optional :tag); long unbroken runs look like keys, not names.
+  if (!/^[@a-z0-9][\w.@/-]{0,120}(:[\w.-]{1,64})?$/i.test(t) || /[A-Za-z0-9_]{24,}/.test(t)) return '';
+  return redactString(t) === t ? t : '';
 }
 
 /** Compact, comparable key used by the engine to match team-configured servers to registry entries. */
@@ -1038,13 +1280,17 @@ const ISSUE_KEY_STOP = new Set([
   'PEP', 'JSR', 'KB', 'MS', 'X', 'H', 'V', 'IPV', 'WIN', 'NET', 'CSS', 'HTML', 'ARM', 'GHSA', 'PR', 'MR', 'P', 'Q',
   'NUGET', 'NPM', 'ID', 'API', 'UI', 'OS', 'VS', 'SQL', 'JDK', 'K', 'S', 'R', 'PY', 'NODE', 'LTS', 'BUG', 'T', 'TASK',
   'GH', 'GHE', 'ISSUE', 'FIX', 'FEAT', 'TICKET', 'STORY', 'RELEASE', 'TLS', 'HTTP2', 'PHP', 'JS', 'TS', 'CS',
+  // Words people number in commit messages that are not tracker projects.
+  'STEP', 'PHASE', 'PART', 'STAGE', 'LEVEL', 'CHAPTER', 'SPRINT', 'WEEK', 'DAY', 'VER', 'VERSION', 'BUILD', 'ITEM',
+  'TEST', 'CASE', 'LAB', 'EX', 'PAGE', 'SEC', 'REV', 'NO', 'NUM', 'ERR', 'ERROR', 'CODE', 'MILESTONE', 'ROUND', 'PASS',
 ]);
 
 export function detectGit(git         , set           )       {
   if (!git.isRepo) return;
   set.add('vcs:git', 0.95, { source: 'git', detail: 'git repository' });
   for (const r of git.remotes) {
-    const h = r.host;
+    // SSH config aliases for several accounts: git@github.com-work:org/repo.git
+    const h = r.host.replace(/^(github\.com|gitlab\.com|bitbucket\.org)[-_][\w.-]{1,60}$/, '$1');
     if (h === 'github.com' || h.endsWith('.ghe.com')) set.add('vcs:github', 0.95, { source: 'git', detail: `remote ${r.name} on ${h}` });
     else if (h === 'gitlab.com' || h.includes('gitlab')) set.add('vcs:gitlab', 0.9, { source: 'git', detail: `remote ${r.name} on ${h}` });
     else if (h === 'dev.azure.com' || h.endsWith('.visualstudio.com') || h === 'ssh.dev.azure.com') {
@@ -1083,7 +1329,10 @@ export function detectGit(git         , set           )       {
 
   // Repeated commit shapes suggest a workflow worth a skill or script.
   const shapes = new Map                ();
+  // Dependency bots (Dependabot, Renovate) write most "bump" commits; they are not a release habit.
+  const BOT = /^(bump (the \S+ group|\S+ from \S+ to )|(chore|build|fix)\(deps(-dev)?\)|update dependency |\[snyk\])/i;
   for (const s of git.recentSubjects) {
+    if (BOT.test(s)) continue;
     // Unicode-aware, so Cyrillic or other non-Latin subjects keep their words.
     const parts = s
       .slice(0, 200)

@@ -229,7 +229,8 @@ describe('manifest parsers', () => {
     assert.deepEqual(pythonManifestNames('[options]\ninstall_requires =\n    sqlalchemy>=2\n    asyncpg\n', 'setup.cfg').sort(), ['asyncpg', 'sqlalchemy']);
   });
   it('reads go.mod, Cargo.toml and JVM builds', () => {
-    assert.deepEqual(goModules('module a\nrequire github.com/lib/pq v1.10.9\nrequire (\n\tk8s.io/client-go v0.31.0 // indirect\n)'), ['github.com/lib/pq', 'k8s.io/client-go']);
+    // Indirect requirements belong to other modules, so only lib/pq counts.
+    assert.deepEqual(goModules('module a\nrequire github.com/lib/pq v1.10.9\nrequire (\n\tk8s.io/client-go v0.31.0 // indirect\n\tgithub.com/gin-gonic/gin v1.10.0\n)'), ['github.com/lib/pq', 'github.com/gin-gonic/gin']);
     assert.deepEqual(cargoDeps('[dependencies]\nserde = "1"\n[dev-dependencies]\nmockall = "0.13"\n[dependencies.sqlx]\nversion = "0.8"\n').sort(), ['mockall', 'serde', 'sqlx']);
     assert.ok(jvmCoordinates("implementation 'org.postgresql:postgresql:42.7.4'").includes('org.postgresql:postgresql'));
   });

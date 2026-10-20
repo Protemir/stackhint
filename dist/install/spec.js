@@ -155,14 +155,34 @@ export function claudeAddArgv(r              , scope                            
 }
 
 /** One-off session command that loads the server without changing any config ("try it"). */
-export function tryCommand(host        , r              , configFile        , platform                  = process.platform)         {
+export function tryCommand(host        , r              , configFile        , platform                  = process.platform, shell                         = platform === 'win32' ? 'powershell' : 'posix')         {
   if (host === 'claude') return `claude --mcp-config "${configFile}"`;
+  // The server definition follows the platform (cmd /c on Windows); the quoting follows the shell.
   const t = codexServerTable(r, platform);
+  if (shell === 'powershell') {
+    // Windows PowerShell 5.1 drops double quotes inside native arguments, so use TOML literal
+    // strings ('...') and PowerShell's '' escape. Registry values never contain quotes.
+    const parts = Object.entries(t).map(([k, v]) => `-c '${`mcp_servers.${r.serverName}.${k}=${tomlLiteralValue(v)}`.replace(/'/g, "''")}'`);
+    return `codex ${parts.join(' ')}`;
+  }
   const parts = Object.entries(t).map(([k, v]) => `-c ${singleQuote(`mcp_servers.${r.serverName}.${k}=${tomlValue(v)}`)}`);
   return `codex ${parts.join(' ')}`;
 }
 
-/** POSIX single quotes; values are validated to contain no quotes or $, so this is also literal in PowerShell. */
+/** POSIX single quotes. */
 function singleQuote(s        )         {
   return `'${s.replace(/'/g, `'"'"'`)}'`;
+}
+
+/** Like tomlValue, but strings become literal strings when they can (no quotes, no control characters). */
+export function tomlLiteralValue(v              )         {
+  const str = (s        )         => (/^[^'\u0000-\u001f\u007f]*$/.test(s) ? `'${s}'` : tomlValue(s));
+  if (typeof v === 'string') return str(v);
+  if (Array.isArray(v)) return '[' + v.map((x) => (typeof x === 'string' ? str(x) : tomlValue(x))).join(', ') + ']';
+  if (typeof v === 'object') {
+    const entries = Object.entries(v);
+    if (entries.length === 0) return '{}';
+    return '{ ' + entries.map(([k, x]) => `${/^[A-Za-z0-9_-]+$/.test(k) ? k : str(k)} = ${typeof x === 'string' ? str(x) : tomlValue(x)}`).join(', ') + ' }';
+  }
+  return tomlValue(v);
 }

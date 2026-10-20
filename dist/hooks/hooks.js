@@ -3,6 +3,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { openSession, runRecommend,              } from '../app.js';
 import { findWorkTree } from '../context/git.js';
@@ -10,6 +11,7 @@ import { classifyTask } from '../context/task.js';
 import { SignalSet } from '../context/signals.js';
 import { recommend } from '../engine/recommend.js';
 import { Store } from '../state/store.js';
+import { which } from '../util/exec.js';
 import { homeDir, samePath,          } from '../util/paths.js';
 import { sanitizeLine } from '../util/text.js';
 
@@ -60,23 +62,34 @@ function logError(store       , e         )       {
   }
 }
 
-function contextText(recs                  , event                                     )         {
+/**
+ * How the agent can run stackhint: the plain name when it is on PATH, otherwise this very script
+ * (people who installed only the plugin have no `stackhint` command).
+ */
+export function cliInvocation(env     , platform                  = process.platform)         {
+  if (which('stackhint', env, platform)) return 'stackhint';
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const js = path.resolve(here, '..', 'cli.js');
+  return `node "${fs.existsSync(js) ? js : path.resolve(here, '..', 'cli.ts')}"`;
+}
+
+function contextText(recs                  , event                                     , cli = 'stackhint')         {
   const lines = [
     event === 'SessionStart'
       ? 'stackhint (a local tool advisor the user installed) found integrations that fit this project and are not set up yet:'
       : "stackhint (a local tool advisor the user installed) noticed the user's request could use an integration that is not set up:",
   ];
   for (const r of recs) {
-    lines.push(`- ${r.entry.name} (fit ${r.score}/100, ${r.confidence} confidence): ${sanitizeLine(r.whyNow, 260)} Details: \`stackhint explain ${r.id}\`.`);
+    lines.push(`- ${r.entry.name} (fit ${r.score}/100, ${r.confidence} confidence): ${sanitizeLine(r.whyNow, 260)} Details: \`${cli} explain ${r.id}\`.`);
   }
   lines.push(
-    'Mention this to the user only if it is relevant to what they are asking, and at most once. Do not install anything yourself: installing needs the user to run `stackhint install <id>` and confirm the change. They can hide a suggestion with `stackhint dismiss <id>` or turn these hints off with `stackhint config set mode manual`.',
+    `Mention this to the user only if it is relevant to what they are asking, and at most once. Do not install anything yourself: installing needs the user to run \`${cli} install <id>\` and confirm the change. They can hide a suggestion with \`${cli} dismiss <id>\` or turn these hints off with \`${cli} config set mode manual\`.`,
   );
   return lines.join('\n');
 }
 
-function output(event                                     , recs                  , visible         )         {
-  const payload                          = { hookSpecificOutput: { hookEventName: event, additionalContext: contextText(recs, event) } };
+function output(event                                     , recs                  , visible         , cli = 'stackhint')         {
+  const payload                          = { hookSpecificOutput: { hookEventName: event, additionalContext: contextText(recs, event, cli) } };
   if (visible) payload['systemMessage'] = `stackhint: ${recs.map((r) => r.entry.name).join(', ')} may help here. Run \`stackhint recommend\` for details.`;
   return JSON.stringify(payload);
 }
@@ -121,10 +134,17 @@ export async function sessionStartHook(input           , deps           = {})   
       project.lastHookAt = new Date(nowMs).toISOString();
       for (const r of picked) project.shown[r.id] = new Date(nowMs).toISOString();
     }
-    store.saveState(state);
+    // Merge into the current file: another session may have written it since we read it.
+    store.updateState((s) => {
+      const p = store.project(s, session.projectKey);
+      p.signals = project.signals;
+      p.strengths = project.strengths ?? {};
+      if (project.lastHookAt) p.lastHookAt = project.lastHookAt;
+      Object.assign(p.shown, project.shown);
+    });
     if (picked.length === 0) return undefined;
     store.audit('hook-suggested', { hook: 'SessionStart', ids: picked.map((r) => r.id), project: session.projectKey });
-    return output('SessionStart', picked, mode === 'proactive');
+    return output('SessionStart', picked, mode === 'proactive', cliInvocation(env, deps.platform));
   } catch (e) {
     logError(store, e);
     return undefined;
@@ -186,10 +206,14 @@ export async function userPromptHook(input           , deps           = {})     
       .filter((r) => !project.shown[r.id] || nowMs - Date.parse(project.shown[r.id]          ) >= cooldownMs)
       .slice(0, 1);
     for (const r of picked) project.shown[r.id] = new Date(nowMs).toISOString();
-    store.saveState(state);
+    store.updateState((s) => {
+      const p = store.project(s, session.projectKey);
+      if (project.sessionTasks) p.sessionTasks = project.sessionTasks;
+      Object.assign(p.shown, project.shown);
+    });
     if (picked.length === 0) return undefined;
     store.audit('hook-suggested', { hook: 'UserPromptSubmit', ids: picked.map((r) => r.id), project: session.projectKey, tasks: newTasks });
-    return output('UserPromptSubmit', picked, false);
+    return output('UserPromptSubmit', picked, false, cliInvocation(env, deps.platform));
   } catch (e) {
     logError(store, e);
     return undefined;

@@ -84,6 +84,12 @@ const OPTIONS = {
   reason: { type: 'string' },
 } as const;
 
+/** How many positional arguments each command takes after its name. */
+const MAX_ARGS: Record<string, number> = {
+  scan: 1, recommend: 1, explain: 2, install: 2, try: 2, status: 1, check: 1, registry: Infinity, dismiss: 1,
+  undismiss: 1, dismissed: 0, rollback: 1, config: 3, doctor: 1, setup: 1, mcp: 0, hook: 1,
+};
+
 /** Which options each command accepts (besides help/format/no-color). */
 const ALLOWED: Record<string, string[]> = {
   scan: ['task'],
@@ -160,6 +166,14 @@ export async function main(argv: string[]): Promise<number> {
   }
   const io = makeIO(!v['no-color'] && useColor(process.stdout));
   const args = positionals.slice(1);
+  if (v.format !== undefined && !['text', 'md', 'json'].includes(v.format)) {
+    process.stderr.write('--format must be text, md or json\n');
+    return 2;
+  }
+  if (args.length > (MAX_ARGS[command] ?? 0)) {
+    process.stderr.write(`Unexpected argument "${args[MAX_ARGS[command] ?? 0]}" for "${command}". Run stackhint --help.\n`);
+    return 2;
+  }
   const format = v.format;
   const need = (n: number, usage: string): void => {
     if (args.length < n) throw new UsageError(`usage: stackhint ${usage}`);
@@ -200,7 +214,7 @@ export async function main(argv: string[]): Promise<number> {
         });
       case 'try':
         need(1, 'try <id> --host <claude|codex> [path]');
-        return await cmdTry(io, { id: args[0] as string, ...(args[1] ? { path: args[1] } : {}), ...(v.host ? { host: v.host } : {}), ...(v.param ? { param: v.param } : {}), ...(v.access ? { access: v.access } : {}) });
+        return await cmdTry(io, { id: args[0] as string, ...(args[1] ? { path: args[1] } : {}), ...(v.host ? { host: v.host } : {}), ...(v.param ? { param: v.param } : {}), ...(v.access ? { access: v.access } : {}), ...(format ? { format } : {}) });
       case 'status':
         return await cmdStatus(io, { ...(args[0] ? { path: args[0] } : {}), ...(v.host ? { host: v.host } : {}), ...(format ? { format } : {}) });
       case 'check':
@@ -211,23 +225,24 @@ export async function main(argv: string[]): Promise<number> {
           need(2, 'registry search <words>');
           return await cmdRegistrySearch(io, { query: args.slice(1).join(' '), ...(v.kind ? { kind: v.kind } : {}), ...(v.remote ? { remote: true } : {}), ...(format ? { format } : {}), ...(v.legacy ? { legacy: true } : {}) });
         }
+        if ((sub === 'list' || sub === undefined) && v.remote) throw new UsageError('--remote works with registry search only');
         if (sub === 'list' || sub === undefined) return await cmdRegistryList(io, { ...(v.kind ? { kind: v.kind } : {}), ...(format ? { format } : {}), ...(v.legacy ? { legacy: true } : {}) });
         throw new UsageError('usage: stackhint registry search <words> | registry list');
       }
       case 'dismiss':
         need(1, 'dismiss <id> [--for 14d] [--project]');
-        return await cmdDismiss(io, { id: args[0] as string, ...(v.for ? { for: v.for } : {}), ...(v.project ? { project: true } : {}), ...(v.reason ? { reason: v.reason } : {}) });
+        return await cmdDismiss(io, { id: args[0] as string, ...(v.for ? { for: v.for } : {}), ...(v.project ? { project: true } : {}), ...(v.reason ? { reason: v.reason } : {}), ...(format ? { format } : {}) });
       case 'undismiss':
         need(1, 'undismiss <id>');
-        return await cmdUndismiss(io, { id: args[0] as string });
+        return await cmdUndismiss(io, { id: args[0] as string, ...(format ? { format } : {}) });
       case 'dismissed':
-        return await cmdDismissed(io);
+        return await cmdDismissed(io, format ? { format } : {});
       case 'rollback':
-        return await cmdRollback(io, { ...(args[0] ? { id: args[0] } : {}), ...(v.yes ? { yes: true } : {}), ...(v.force ? { force: true } : {}) });
+        return await cmdRollback(io, { ...(args[0] ? { id: args[0] } : {}), ...(v.yes ? { yes: true } : {}), ...(v.force ? { force: true } : {}), ...(format ? { format } : {}) });
       case 'config':
-        return await cmdConfig(io, { ...(args[0] ? { action: args[0] } : {}), ...(args[1] ? { key: args[1] } : {}), ...(args[2] !== undefined ? { value: args[2] } : {}) });
+        return await cmdConfig(io, { ...(args[0] ? { action: args[0] } : {}), ...(args[1] ? { key: args[1] } : {}), ...(args[2] !== undefined ? { value: args[2] } : {}), ...(format ? { format } : {}) });
       case 'doctor':
-        return await cmdDoctor(io, { ...(args[0] ? { path: args[0] } : {}) });
+        return await cmdDoctor(io, { ...(args[0] ? { path: args[0] } : {}), ...(format ? { format } : {}) });
       case 'setup':
         need(1, 'setup <claude|codex>');
         return await cmdSetup(io, { host: args[0] as string, ...(v['dry-run'] ? { dryRun: true } : {}), ...(v.yes ? { yes: true } : {}) });

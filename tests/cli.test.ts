@@ -142,7 +142,8 @@ describe('CLI commands', () => {
     assert.ok(fs.existsSync(path.join(b.stackhome, 'try', 'context7.mcp.json')));
     assert.deepEqual(diffSnapshots(before, snapshot(b.project)), []);
     const c = cli(b, ['try', 'linear', '--host', 'codex']);
-    assert.match(c.out, /codex -c 'mcp_servers\.linear\.url="https:\/\/mcp\.linear\.app\/mcp\/readonly"'/);
+    if (process.platform === 'win32') assert.match(c.out, /codex -c 'mcp_servers\.linear\.url=''https:\/\/mcp\.linear\.app\/mcp\/readonly'''/);
+    else assert.match(c.out, /codex -c 'mcp_servers\.linear\.url="https:\/\/mcp\.linear\.app\/mcp\/readonly"'/);
   });
 
   it('dismiss, dismissed, undismiss', () => {

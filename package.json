@@ -1,6 +1,6 @@
 {
   "name": "stackhint",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Recommends MCP servers, plugins, skills and CLIs that fit your repo, for Claude Code and Codex. Local, offline, asks before it changes anything.",
   "type": "module",
   "bin": {

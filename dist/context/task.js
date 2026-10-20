@@ -8,9 +8,11 @@ import { SignalSet } from './signals.js';
 
 const RULES         = [
   // categories
-  [/\b(pull request|pull-request|\bpr\b|prs\b|code review|review (the|this|my) (pr|change|diff)|merge request|\bmr\b)|пулл?[- ]?реквест|ревью|код[- ]?ревью/i, [['task:pr-review', 0.9]]],
+  [/\b(pull request|pull-request|\bpr\b|prs\b|code review|review (the|this|my) (pr|change|diff)|merge request|\bmr ?!\d+)|пулл?[- ]?реквест|ревью|код[- ]?ревью/i, [['task:pr-review', 0.9]]],
+  // "MR" in capitals only: "Mr. Smith" is a person.
+  [/(?<![\w.])MRs?(?![\w.])/, [['task:pr-review', 0.85]]],
   [/\b(ticket|issue|backlog|sprint|epic|user story|bug report)s?\b|тикет|бэклог|спринт|эпик/i, [['task:issue-tracking', 0.75]]],
-  [/\b(sql|query|queries|database|db|explain analyze|deadlock|slow quer\w*|migrations?|schema|(add|adding|missing|create|drop|unused) (an? )?index(es)?)\b|запрос|баз[аеуы] данных|индекс|миграци/i, [['task:db', 0.8]]],
+  [/\b(sql|query|queries|database|db|explain analyze|deadlock|slow quer\w*|migrations?|schema|(add|adding|missing|create|drop|unused) (an? )?index(es)?(?![.\w]))\b|запрос|баз[аеуы] данных|индекс|миграци/i, [['task:db', 0.8]]],
   [/\b(rest ?api|restful|endpoint|openapi|swagger|api|graphql|grpc|webhook)s?\b|эндпоинт|апи(?![а-яё])/i, [['task:api', 0.7]]],
   [/\b(test|tests|testing|e2e|end-to-end|flaky|coverage|unit test|integration test)\b|тест/i, [['task:testing', 0.75]]],
   [/\b(ci|cd|pipeline|github actions|workflow run|build (is )?(failing|broken|red)|deploy(ment)?|release)\b|пайплайн|деплой|сборк[аи] (пада|слома)/i, [['task:ci', 0.75]]],
@@ -21,16 +23,20 @@ const RULES         = [
   [/\b(exception|stack ?trace|crash|error rate|sentry|logs?|metrics|grafana|alert|incident|outage|latency)\b|ошибк|исключени|падает|(?<![а-яё])лог[иа]?(?![а-яё])|метрик|инцидент/i, [['task:observability', 0.7]]],
   [/\b(aws|azure|gcp|google cloud|cloudflare|vercel|terraform|s3|lambda|iam)\b|облак/i, [['task:cloud', 0.75]]],
   [/\b(figma|design|mockup|wireframe)\b|макет|дизайн/i, [['task:design', 0.75]]],
-  [/\b(stripe|payment|checkout|subscription|billing|invoice)s?\b|оплат|платеж|подписк/i, [['task:payments', 0.75]]],
+  [/\b(payment|checkout|subscription|billing|invoice)s?\b|оплат|платеж|подписк/i, [['task:payments', 0.75]]],
   [/\b(security|vulnerab|cve|sast|secret scan|dependency audit)\w*\b|уязвим|безопасност/i, [['task:security', 0.75]]],
   [/\b(nuget|npm|package|dependenc(y|ies)|upgrade|outdated)\b|пакет|зависимост/i, [['task:dependencies', 0.6]]],
 
   // explicit products
   [/\bjira\b|джир/i, [['tracker:jira', 0.9], ['task:issue-tracking', 0.8]]],
-  [/\bconfluence\b|конфлюенс/i, [['tracker:confluence', 0.9]]],
+  [/\bconfluence\b(?!\s+of\b)|конфлюенс/i, [['tracker:confluence', 0.9]]],
   // "linear" alone is too common (linear-gradient, linear regression): require tracker context.
   // Only phrases that clearly mean the tracker: "in/from/to/into Linear", "a Linear issue/board/...".
-  [/\b(in|from|to|into|on) linear\b(?!-|\s+(time|scale|scaling|regression|algebra|search|scan|order|fashion|interpolation|combination|equation|model|programming|layout|motion|easing|growth|gradient|space|map|mode|form|function|probing|least))|(?<![\w-])linear (issues?|tickets?|boards?|cycles?|workspace|projects?|backlog|teams?|triage|inbox)\b/i, [['tracker:linear', 0.7]]],
+  // Capital L only: "from sRGB to linear colour", "in linear time" are not the tracker.
+  [/\b(in|from|to|into|on) Linear\b(?!-|\s+(time|scale|scaling|regression|algebra|search|scan|order|fashion|interpolation|combination|equation|model|programming|layout|motion|easing|growth|gradient|space|map|mode|form|function|probing|least))/, [['tracker:linear', 0.7]]],
+  [/(?<![\w-])linear (issues?|tickets?|boards?|cycles?|workspace|projects?|backlog|teams?|triage|inbox)\b/i, [['tracker:linear', 0.7]]],
+  // Lowercase is fine when the sentence is about tickets and "linear" ends the phrase: "the next issue in linear".
+  [/\b(issues?|tickets?|tasks?|bugs?|boards?|backlog|cycles?|sprints?|stories)\b.{0,40}\b(in|from|to|into|on) linear\s*([.,;:!?)]|$)/i, [['tracker:linear', 0.7]]],
   [/\bgithub\b|гитхаб/i, [['vcs:github', 0.9]]],
   [/\bgitlab\b|гитлаб/i, [['vcs:gitlab', 0.9]]],
   [/\bazure devops\b|\bado\b|azure boards|azure pipelines/i, [['vcs:azure-repos', 0.8], ['ci:azure-pipelines', 0.6]]],
@@ -59,17 +65,73 @@ const RULES         = [
   [/\bsentry\b/i, [['obs:sentry', 0.9]]],
   [/\bgrafana\b|\bprometheus\b/i, [['obs:grafana', 0.8]]],
   [/\bfigma\b/i, [['design:figma', 0.9]]],
-  [/\bnotion\b/i, [['docs:notion', 0.85]]],
+  // "I have a notion", "the notion of": the word, not the product.
+  [/(?<!\b(an?|no|any|some|vague|general|rough)\s)\bnotion\b(?!\s+(of|that)\b)/i, [['docs:notion', 0.85]]],
   [/\bpostman\b/i, [['api:postman', 0.9]]],
   [/\bsonar(qube|cloud)?\b/i, [['quality:sonar', 0.9]]],
   [/\bsemgrep\b/i, [['quality:semgrep', 0.9]]],
   [/\bsnyk\b/i, [['quality:snyk', 0.9]]],
   [/\bplaywright\b/i, [['tool:playwright', 0.9], ['test:e2e', 0.7]]],
-  [/\bstripe\b/i, [['payments:stripe', 0.9]]],
+  // "Stripe", or stripe next to payment words; a zebra stripe is not a payment provider.
+  [/\bStripe\b/, [['payments:stripe', 0.9], ['task:payments', 0.75]]],
+  [/\bstripe\b(?=.{0,40}\b(payments?|checkout|webhooks?|api|keys?|subscriptions?|customers?|invoices?|charges?|prices?|connect|billing|cli|sdk|dashboard)\b)|\b(payments?|checkout|webhooks?|billing|subscriptions?)\b.{0,40}\bstripe\b|\b(integrate|integrating|set ?up|setting up|connect|switch(ing)? to|migrat\w* to|using|via|with) stripe\b/i, [['payments:stripe', 0.9], ['task:payments', 0.75]]],
   [/\bcircle ?ci\b/i, [['ci:circleci', 0.9]]],
   [/\bbuildkite\b/i, [['ci:buildkite', 0.9]]],
   [/\bjenkins\b/i, [['ci:jenkins', 0.9]]],
   [/(?<![\w.])(\.net|c#|f#)(?![\w#])|\b(dotnet|csharp|asp\.net|ef core|entity framework|nuget)\b|дотнет/i, [['tech:dotnet', 0.85]]],
+  // Observability, hosting and data services
+  [/\bdatadog\b/i, [['obs:datadog', 0.9]]],
+  [/\bNew ?Relic\b/, [['obs:newrelic', 0.9]]],
+  [/\bnewrelic\b|\bnrql\b|\bnew relic (apm|agents?|dashboards?|alerts?|quer(y|ies)|metrics|logs|accounts?|licen[cs]e|traces?|entit(y|ies))\b/i, [['obs:newrelic', 0.9]]],
+  // "a honeycomb grid" is a shape; the product comes with its own words.
+  [/\bhoneycomb\.io\b|\bhoneycomb (traces?|quer(y|ies)|datasets?|boards?|triggers?|slos?|events?|api keys?|environments?)\b|\b(in|to|from) Honeycomb\b/i, [['obs:honeycomb', 0.85]]],
+  [/\bpager ?duty\b/i, [['obs:pagerduty', 0.9]]],
+  [/\bdynatrace\b/i, [['obs:dynatrace', 0.9]]],
+  [/\bposthog\b/i, [['obs:posthog', 0.9]]],
+  [/\bnetlify\b/i, [['cloud:netlify', 0.9]]],
+  [/\bheroku\b/i, [['cloud:heroku', 0.9]]],
+  [/\brender\.com\b/i, [['cloud:render', 0.8]]],
+  [/\brailway\.app\b|\brailway (up|deploy|deployments?|services?|projects?|cli|environments?|volumes?)\b/i, [['cloud:railway', 0.85]]],
+  [/\b(on|to|in|from) Railway\b/, [['cloud:railway', 0.85]]],
+  [/\bfly\.io\b|\bflyctl\b/i, [['cloud:fly', 0.9]]],
+  [/\bpulumi\b/i, [['infra:pulumi', 0.9]]],
+  [/\bdigital ?ocean\b|\bdoctl\b/i, [['cloud:digitalocean', 0.9]]],
+  [/\bplanet ?scale\b|\bpscale\b/i, [['db:planetscale', 0.9]]],
+  [/\bturso\b/i, [['db:turso', 0.9]]],
+  [/\bupstash\b|\bqstash\b/i, [['db:upstash', 0.9]]],
+  [/\balgolia\b/i, [['db:algolia', 0.9]]],
+  [/\bcontentful\b/i, [['tech:contentful', 0.9]]],
+  // "sanity check" is not the CMS.
+  [/\bsanity\.io\b|\bsanity (studio|cms|datasets?|content lake)\b|\bSanity (schemas?|documents?|quer(y|ies)|groq)\b/i, [['tech:sanity', 0.8]]],
+  [/\bSlack\b(?![-\w])|\bslack (channels?|messages?|bots?|apps?|workspaces?|notifications?|webhooks?)\b/, [['tool:slack', 0.85]]],
+  [/\bauth0\b/i, [['tech:auth0', 0.9]]],
+  [/\bClerk\b(?=.{0,30}\b(auth\w*|sign.?in|sign.?up|users?|sessions?|middleware|webhooks?|organi[sz]ations?)\b)/, [['tech:clerk', 0.8]]],
+  [/\bclerk (auth\w*|sign.?in|sign.?up|middleware|webhooks?|session tokens?)\b|\bclerk\.com\b/i, [['tech:clerk', 0.8]]],
+  [/\btwilio\b/i, [['api:twilio', 0.9]]],
+  [/\basana\b/i, [['tracker:asana', 0.9], ['task:issue-tracking', 0.8]]],
+  [/\bmonday\.com\b/i, [['tracker:monday', 0.9], ['task:issue-tracking', 0.8]]],
+  [/\bClickUp\b|\bclickup\b/, [['tracker:clickup', 0.9], ['task:issue-tracking', 0.8]]],
+  // Frameworks, engines and SDKs with their own tools
+  // "angular velocity" is physics.
+  [/\bangular (apps?|components?|services?|modules?|cli|projects?|router|signals?|material|forms?|directives?|pipes?|ssr|standalone|upgrade|version|v?\d{2})\b|\bng (serve|build|generate|update|test)\b|\b(in|to|from|with) Angular\b|\bangular\.json\b/i, [['tech:angular', 0.85]]],
+  [/\bsvelte(kit)?\b/i, [['tech:svelte', 0.85]]],
+  [/\bnx (workspace|monorepo|affected|graph|cloud)\b|\bNx\b/, [['tool:nx', 0.8]]],
+  [/\bshopify\b/i, [['tech:shopify', 0.85]]],
+  [/\bexpo (app|router|go|sdk|eas|builds?|export|prebuild|start|updates?|modules?|push)\b|\b(with|in|on|to) Expo\b|\beas (build|submit|update)\b/i, [['tech:expo', 0.8]]],
+  [/\blaravel\b/i, [['tech:laravel', 0.85]]],
+  [/\bstorybook\b/i, [['tool:storybook', 0.85]]],
+  [/\bastro (components?|islands?|pages?|config|content|collections?|actions?|db|sites?|projects?)\b|\bastro\.config\b|\b(in|with|to) Astro\b/i, [['tech:astro', 0.8]]],
+  [/\bnuxt\b/i, [['tech:nuxt', 0.85]]],
+  [/\bhugging ?face\b/i, [['ml:huggingface', 0.85]]],
+  [/\bflutter\b/i, [['tech:flutter', 0.85], ['lang:dart', 0.7]]],
+  [/\bxcode\b/i, [['tech:xcode', 0.85]]],
+  [/\bunity (editor|scenes?|projects?|packages?|prefabs?|engine|games?|scripts?|assets?|6|20\d\d)\b|\b(in|to|from) Unity\b|\bmonobehaviou?r\b|\bgameobjects?\b/i, [['tech:unity', 0.85]]],
+  [/\bunreal (engine|editor|projects?|blueprints?|plugins?|levels?|c\+\+)\b|\bue[45]\b|\b(in|to|from) Unreal\b/i, [['tech:unreal', 0.85]]],
+  [/\bshadcn\b/i, [['tool:shadcn', 0.85]]],
+  [/\bdevelocity\b|\bgradle enterprise\b|\bgradle build scans?\b/i, [['tool:develocity', 0.8]]],
+  [/\bmcp server\b/i, [['tech:mcp-server', 0.7]]],
+  [/\bclaude agent sdk\b/i, [['tech:claude-agent-sdk', 0.85]]],
+  [/\bclaude code plugin\b/i, [['tech:claude-plugin', 0.85]]],
 ];
 
 export function classifyTask(text        , set           )           {

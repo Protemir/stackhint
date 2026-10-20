@@ -119,12 +119,13 @@ Every command takes `--format text|md|json`. Exit codes: 0 ok, 1 error, 2 usage 
 
 ## What it looks at
 
-- Package manifests: `*.csproj`, `Directory.Packages.props`, `package.json`, `requirements*.txt`, `pyproject.toml`, `Pipfile`, `go.mod`, `Cargo.toml`, `pom.xml`, `build.gradle`, `composer.json`, `Gemfile`, Prisma schemas.
-- Infrastructure: Dockerfiles, compose files (service images like `postgres:17`), Kubernetes manifests, Helm charts, Argo CD and Flux objects, Terraform providers, Bicep, CDK, Wrangler, Vercel, Firebase and Supabase configs.
+- Package manifests: `*.csproj`, `Directory.Packages.props`, `package.json`, `requirements*.txt` (also `requirements/` folders and UTF-16 files), `pyproject.toml` (Poetry, uv, PDM), `Pipfile`, `go.mod` (direct requirements only), `Cargo.toml`, `pom.xml`, `build.gradle(.kts)`, Gradle version catalogs, `composer.json`, `Gemfile`, `pubspec.yaml`, Prisma schemas.
+- Infrastructure: Dockerfiles, compose files (service images like `postgres:17`), Kubernetes manifests, Helm charts, Argo CD and Flux objects, Terraform providers, Pulumi, Bicep, CDK, and the configs of Wrangler, Vercel, Netlify, Fly.io, Render, Railway, Heroku, DigitalOcean, Firebase and Supabase.
+- Frameworks and engines: Angular, Svelte, Nuxt, Astro, Next.js, Expo, Flutter, Shopify apps and themes, Laravel, Storybook, Nx, shadcn/ui, Xcode, Unity, Unreal, browser extensions, browser games (three.js, Phaser, Pixi) and plain pages with scripts.
 - CI: GitHub Actions, GitLab CI, Azure Pipelines, CircleCI, Jenkins, Buildkite, Bitbucket.
 - APIs and tests: OpenAPI files, `.http` files, Postman collections, protobuf, GraphQL, Playwright/Cypress/Jest/Vitest/pytest configs.
 - Settings files: `appsettings*.json` connection strings and `.env.example` key names, only to learn which database or service is used. Values are never stored or printed.
-- Links in README/CONTRIBUTING: Jira, Confluence, Linear, Figma, Notion.
+- Links in README/CONTRIBUTING: Jira, Confluence, Linear, Asana, monday.com, ClickUp, Figma, Notion.
 - Git: remote hosts, branch names, recent commit subjects (local `git log`). Issue keys like `SHOP-123` suggest Jira; 8+ commits with the same shape ("add migration ...") suggest a skill.
 - MCP servers your team already configured for VS Code or Cursor (`.vscode/mcp.json`, `.cursor/mcp.json`).
 - Your task, if you pass one. English and Russian keywords both work.
@@ -218,7 +219,7 @@ Limitations, honestly:
 
 ## The registry
 
-[`registry/registry.json`](registry/registry.json) has 68 entries: 51 recommendable tools and 17 deprecated or archived ones that stackhint detects in your config so it can suggest the replacement. Every URL, package name, flag and plugin id was checked against the vendor's repository or docs on the date in `verifiedAt` (October 2026). Effort, time saved and frequency are my estimates.
+[`registry/registry.json`](registry/registry.json) has 143 entries: 120 recommendable tools (89 MCP servers, 28 plugins, 2 CLIs, 1 skill) and 23 deprecated or archived ones that stackhint detects in your config so it can suggest the replacement. Every URL, package name, flag and plugin id was checked against the vendor's repository or docs on the date in `verifiedAt` (October 2026). Effort, time saved and frequency are my estimates.
 
 It covers source control (GitHub, GitLab, Azure DevOps), issue trackers (Jira/Confluence, Linear), databases (Postgres, MySQL, SQL Server, ClickHouse, MongoDB, Redis, Supabase, Neon, Firebase), containers and infrastructure (Kubernetes, Docker, Terraform, Argo CD, Flux), clouds (AWS, Azure, Google Cloud, Cloudflare, Vercel), docs (Context7, Microsoft Learn, DeepWiki), CI (CircleCI, Buildkite, Jenkins), quality (SonarQube, Semgrep, Snyk), observability (Sentry, Grafana), design (Figma), payments (Stripe), browser testing (Playwright, Chrome DevTools), Claude Code LSP and review plugins, and project skills for repeated workflows.
 
@@ -254,7 +255,7 @@ Put a JSON file in `~/.stackhint/registry.d/` (or point `STACKHINT_REGISTRY` at 
 
 Validation rejects entries that could be abused: shell metacharacters or quotes in arguments, interpreters and downloaders as commands (`bash`, `curl`, `powershell`, `node`...), privileged Docker flags and host mounts, plain-HTTP URLs (except localhost), literal secrets in headers, env or arguments, and text that tries to instruct the agent ("ignore previous instructions", fake `</system>` tags). Missing metadata is filled with cautious defaults (unknown access is treated as write) and lowers confidence.
 
-`stackhint scan` lists every signal id the analyzer can produce. To add a built-in tool, open a pull request with the entry plus the sources you checked; `npm test` verifies that every trigger is a signal the analyzer emits, that install specs render valid JSON and TOML for both hosts, and that plugin ids exist in the official marketplace.
+`stackhint scan` shows the signal ids found in a project; the full set the analyzer can produce lives in `src/context/` (`packages.ts`, `analyzer.ts`, `task.ts`). To add a built-in tool, open a pull request with the entry plus the sources you checked; `npm test` verifies that every trigger is a signal the analyzer emits, that install specs render valid JSON and TOML for both hosts, and that plugin ids exist in the official marketplace.
 
 ## Configuration
 
@@ -297,7 +298,7 @@ The engine knows nothing about host config formats; adapters turn configs into a
 npm install          # TypeScript and @types/node, for type checking only
 npm run typecheck
 npm run lint
-npm test             # 270+ tests: node --test on the TypeScript sources (Node 22.18+)
+npm test             # 300+ tests: node --test on the TypeScript sources (Node 22.18+)
 npm run build        # writes dist/
 npm run test:dist    # smoke tests on the built JavaScript (works on Node 20)
 ```
