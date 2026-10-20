@@ -47,17 +47,40 @@ const PARAM_NAME = /^[A-Za-z][A-Za-z0-9]{0,31}$/;
 /** Shell metacharacters and quoting we never allow in commands or arguments. */
 const SHELL_META = /[;&|`$<>\\"'%^!\r\n\u0000]/;
 
+/** Control, zero-width and bidi characters: they can disguise what a command really says. */
+// eslint-disable-next-line no-control-regex
+const INVISIBLE = /[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁠-⁤⁦-⁩﻿]/;
+
+/** Literal header and env values: plain words only, no quotes, no $ (no ${VAR} expansion tricks). */
+const SAFE_VALUE = /^[A-Za-z0-9 ._:/=,+@*-]{0,200}$/;
+
 /** Programs that would let a registry entry run arbitrary code or fetch-and-execute. */
 const DENIED_COMMANDS = new Set([
-  'sh', 'bash', 'zsh', 'fish', 'dash', 'ksh', 'csh', 'cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh',
-  'curl', 'wget', 'iex', 'invoke-expression', 'python', 'python3', 'py', 'node', 'deno', 'bun', 'perl', 'ruby',
-  'php', 'eval', 'exec', 'sudo', 'su', 'doas', 'rm', 'del', 'rmdir', 'mv', 'cp', 'chmod', 'chown', 'osascript',
+  'sh', 'bash', 'zsh', 'fish', 'dash', 'ksh', 'csh', 'tcsh', 'cmd', 'powershell', 'pwsh', 'wsl', 'busybox',
+  'curl', 'wget', 'iex', 'invoke-expression', 'python', 'python2', 'python3', 'py', 'pythonw', 'node', 'nodejs', 'deno',
+  'bun', 'perl', 'ruby', 'php', 'lua', 'tclsh', 'eval', 'exec', 'env', 'xargs', 'nohup', 'timeout', 'nice', 'start',
+  'sudo', 'su', 'doas', 'runas', 'rm', 'del', 'rmdir', 'mv', 'cp', 'dd', 'chmod', 'chown', 'osascript', 'open',
   'mshta', 'rundll32', 'regsvr32', 'certutil', 'bitsadmin', 'wscript', 'cscript', 'ssh', 'scp', 'nc', 'ncat', 'socat',
+  'git', 'make', 'awk', 'sed', 'find',
 ]);
 
-/** Text that tries to instruct an agent rather than describe a tool. */
+/** Text that tries to instruct an agent rather than describe a tool. Checked after normalization. */
 const INSTRUCTION_LIKE =
-  /(ignore (all |any )?(the )?(previous|prior|above|earlier) (instructions|messages)|disregard (the|your|all) (instructions|rules)|you are now|system prompt|developer message|<\/?(system|assistant|tool)>|run (this|the following) command|curl [^\n]*\|\s*(ba)?sh|iwr [^\n]*\|\s*iex|rm -rf|exfiltrat|send (the|your) (token|secret|key|password)s?)/i;
+  /(ignore (all |any )?(the )?(previous|prior|above|earlier|preceding) (instructions|messages|rules)|disregard (the|your|all|any) (instructions|rules)|forget (all |your )?(previous )?instructions|you are now|system prompt|developer message|<\/?(system|assistant|tool|user)>|run (this|the following) command|(curl|wget|iwr|irm|invoke-webrequest) [^\n]{0,200}\| ?(ba|z)?sh|\| ?iex|rm -rf|exfiltrat|send (the|your|all) (token|secret|key|password|credential)s?)/i;
+
+/** Normalize text before looking for instructions: NFKC, no invisible characters, single spaces. */
+function normalizeForScan(s: string): string {
+  return s
+    .normalize('NFKC')
+    .replace(new RegExp(INVISIBLE.source, 'g'), '')
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+}
+
+/** Strip a Windows executable extension and lowercase, so "node.exe" is checked as "node". */
+function commandBase(c: string): string {
+  return c.toLowerCase().replace(/\.(exe|cmd|bat|com|ps1)$/, '');
+}
 
 export interface LoadOptions {
   /** Extra registry files (JSON with an entries array), e.g. from ~/.stackhint/registry.d. */
@@ -165,22 +188,26 @@ function oneOf<T extends string>(v: unknown, allowed: readonly T[], fallback: T)
 }
 
 export function isSafeUrl(url: string): boolean {
-  if (/\s|["'`<>\\]/.test(url)) return false;
+  if (url.length > 500 || /\s|["'`<>\\$]/.test(url) || INVISIBLE.test(url)) return false;
   if (/^https:\/\/[A-Za-z0-9.-]+(:\d{1,5})?(\/[^\s]*)?$/.test(url)) return true;
   return /^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?(\/[^\s]*)?$/.test(url);
 }
 
+/** Every string anywhere in the entry, keys included. */
 function textFieldsOf(raw: Obj): string[] {
   const out: string[] = [];
-  const walk = (v: unknown): void => {
-    if (typeof v === 'string') out.push(v);
-    else if (Array.isArray(v)) v.forEach(walk);
-    else if (isObj(v)) Object.values(v).forEach(walk);
+  const walk = (v: unknown, depth: number): void => {
+    if (depth > 8 || out.length > 2000) return;
+    if (typeof v === 'string') out.push(v.slice(0, 5000));
+    else if (Array.isArray(v)) v.forEach((x) => walk(x, depth + 1));
+    else if (isObj(v)) {
+      for (const [k, x] of Object.entries(v)) {
+        out.push(k.slice(0, 200));
+        walk(x, depth + 1);
+      }
+    }
   };
-  for (const key of ['name', 'description', 'problem', 'workflow', 'benefits', 'limitations', 'securityNotes', 'guide', 'statusNote']) walk(raw[key]);
-  if (isObj(raw['access'])) walk(raw['access']['summary']);
-  if (isObj(raw['auth'])) walk(raw['auth']['detail']);
-  walk(raw['network']);
+  walk(raw, 0);
   return out;
 }
 
@@ -198,7 +225,7 @@ export function validateEntry(raw: unknown, ctx: ValidateContext = { origin: 'cu
   const description = sanitize(raw['description'], 600);
   if (!description) return { errors: ['missing description'] };
 
-  const suspicious = textFieldsOf(raw).find((t) => INSTRUCTION_LIKE.test(t));
+  const suspicious = textFieldsOf(raw).find((t) => INSTRUCTION_LIKE.test(normalizeForScan(t)));
   if (suspicious) return { errors: ['text contains instruction-like content; entry rejected'] };
 
   const docs = str(raw['docs']) ?? '';
@@ -328,7 +355,7 @@ export function validateEntry(raw: unknown, ctx: ValidateContext = { origin: 'cu
   return { entry, errors };
 }
 
-function validateServerSpec(raw: unknown, params: Param[], partial: boolean): { spec?: ServerSpec; error?: string } {
+export function validateServerSpec(raw: unknown, params: Param[], partial: boolean): { spec?: ServerSpec; error?: string } {
   if (!isObj(raw)) return { error: 'server spec must be an object' };
   const transport = raw['transport'];
   if (!partial && transport !== 'http' && transport !== 'stdio') return { error: 'transport must be http or stdio' };
@@ -356,8 +383,10 @@ function validateServerSpec(raw: unknown, params: Param[], partial: boolean): { 
     if (!isObj(raw['headers'])) return { error: 'headers must be an object' };
     const headers: Record<string, string> = {};
     for (const [k, v] of Object.entries(raw['headers'])) {
-      if (!HEADER_NAME.test(k) || typeof v !== 'string' || /[\r\n]/.test(v)) return { error: `invalid header ${k}` };
+      if (!HEADER_NAME.test(k) || typeof v !== 'string') return { error: `invalid header ${k}` };
       if (looksLikeLiteralSecret(k, v)) return { error: `header ${k} contains a literal secret; use bearerTokenEnv or envHeaders` };
+      // No quotes, no $ (Claude Code expands ${VAR} in headers, which could send any env var to the server).
+      if (!SAFE_VALUE.test(v)) return { error: `header ${k} has characters that are not allowed; use envHeaders for values from the environment` };
       headers[k] = v;
     }
     spec.headers = headers;
@@ -379,7 +408,7 @@ function validateServerSpec(raw: unknown, params: Param[], partial: boolean): { 
   if (raw['command'] !== undefined) {
     const c = str(raw['command']);
     if (!c || !EXECUTABLE.test(c)) return { error: 'command must be a bare executable name' };
-    if (DENIED_COMMANDS.has(c.toLowerCase())) return { error: `command "${c}" is not allowed` };
+    if (DENIED_COMMANDS.has(commandBase(c))) return { error: `command "${c}" is not allowed` };
     spec.command = c;
   }
   if (raw['args'] !== undefined) {
@@ -387,21 +416,21 @@ function validateServerSpec(raw: unknown, params: Param[], partial: boolean): { 
     const args = raw['args'] as string[];
     for (let i = 0; i < args.length; i++) {
       const a = args[i] as string;
-      if (SHELL_META.test(a)) return { error: `argument contains shell metacharacters: ${sanitizeLine(a, 40)}` };
+      if (SHELL_META.test(a) || INVISIBLE.test(a) || a.length > 300) return { error: `argument contains shell metacharacters or hidden characters: ${sanitizeLine(a, 40)}` };
       const bad = checkPlaceholders(a);
       if (bad) return { error: bad };
       if (looksLikeLiteralSecret(args[i - 1] ?? '', a) || /^--?[a-z-]*(token|key|secret|password)[a-z-]*=.+/i.test(a)) {
         return { error: 'arguments must not carry secrets; use passEnv' };
       }
     }
-    if (spec.command === 'docker' || raw['command'] === 'docker') {
+    if (typeof raw['command'] === 'string' && /^(docker|podman|nerdctl)$/.test(commandBase(raw['command']))) {
       for (let i = 0; i < args.length; i++) {
-        const a = args[i] as string;
-        if (/^--privileged$|^--pid=host$|^--net(work)?=host$|^--cap-add|^--security-opt/.test(a)) return { error: `docker flag ${a} is not allowed` };
-        if ((a === '-v' || a === '--volume' || a === '--mount') && /^(\/|[A-Za-z]:|\/var\/run\/docker\.sock|type=bind)/.test(args[i + 1] ?? '')) {
-          return { error: 'docker host mounts are not allowed in the registry' };
-        }
-        if (/^(-v|--volume)=?\//.test(a)) return { error: 'docker host mounts are not allowed in the registry' };
+        const a = (args[i] as string).toLowerCase();
+        const next = (args[i + 1] ?? '').toLowerCase();
+        // Privileges, host namespaces and any mount are refused outright, in every spelling.
+        if (/^--(privileged|cap-add|security-opt|device|volumes-from|group-add)(=|$)/.test(a)) return { error: `docker flag ${a} is not allowed` };
+        if (/^--(pid|net|network|ipc|uts|userns|cgroupns)(=|$)/.test(a) && (a.endsWith('=host') || next === 'host')) return { error: `docker flag ${a} host is not allowed` };
+        if (/^(-v|--volume|--mount|--tmpfs)(=|$)/.test(a) || /^-v./.test(a)) return { error: 'docker mounts are not allowed in the registry' };
       }
     }
     spec.args = args;
@@ -410,8 +439,9 @@ function validateServerSpec(raw: unknown, params: Param[], partial: boolean): { 
     if (!isObj(raw['env'])) return { error: 'env must be an object' };
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries(raw['env'])) {
-      if (!ENV_NAME.test(k) || typeof v !== 'string' || v.length > 200 || /[\r\n]/.test(v)) return { error: `invalid env ${k}` };
+      if (!ENV_NAME.test(k) || typeof v !== 'string') return { error: `invalid env ${k}` };
       if (looksLikeLiteralSecret(k, v)) return { error: `env ${k} contains a literal secret; use passEnv` };
+      if (!SAFE_VALUE.test(v)) return { error: `env ${k} has characters that are not allowed; use passEnv for values from the environment` };
       env[k] = v;
     }
     spec.env = env;
@@ -448,12 +478,17 @@ function validateInstall(raw: unknown): { install?: InstallSpec; error?: string 
         example: sanitizeLine(p['example'], 120),
       };
       if (typeof p['pattern'] === 'string') {
+        const pattern = p['pattern'];
+        // Patterns come from registry files; refuse nested quantifiers that could backtrack for minutes.
+        if (pattern.length > 200 || /\([^)]*[+*}][^)]*\)\s*[+*{]/.test(pattern) || /\\[1-9]/.test(pattern)) {
+          return { error: `param ${param.name}: pattern is too complex` };
+        }
         try {
-          new RegExp(p['pattern']);
+          new RegExp(pattern);
         } catch {
           return { error: `param ${param.name}: invalid pattern` };
         }
-        param.pattern = p['pattern'];
+        param.pattern = pattern;
       }
       if (typeof p['default'] === 'string') {
         if (!paramValueOk(param, p['default'])) return { error: `param ${param.name}: default does not match its pattern` };
@@ -492,9 +527,9 @@ function validateInstall(raw: unknown): { install?: InstallSpec; error?: string 
 const DEFAULT_PARAM = /^[A-Za-z0-9._:-]{1,100}$/;
 
 export function paramValueOk(param: Param, value: string): boolean {
-  if (/[\s"'`$;&|<>\\%^!]/.test(value)) return false;
+  if (value.length > 200 || /[\s"'`$;&|<>\\%^!#?]/.test(value) || INVISIBLE.test(value)) return false;
   const re = param.pattern ? new RegExp(param.pattern) : DEFAULT_PARAM;
-  return re.test(value) && value.length <= 200;
+  return re.test(value);
 }
 
 // ---------------- search ----------------
@@ -570,6 +605,11 @@ export function editDistance(a: string, b: string): number {
     }
   }
   return prev[b.length] as number;
+}
+
+/** No longer maintained: deprecated, archived or removed. */
+export function isRetired(e: RegistryEntry): boolean {
+  return e.status === 'deprecated' || e.status === 'archived' || e.status === 'removed';
 }
 
 export function isLegacy(e: RegistryEntry): boolean {

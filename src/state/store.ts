@@ -60,6 +60,8 @@ export interface ProjectState {
   lastHookAt?: string;
   shown: Record<string, string>;
   signals: string[];
+  /** Signal strengths from the last full scan, used by the prompt hook. */
+  strengths?: Record<string, number>;
   /** Task categories seen by the prompt hook in the current session. */
   sessionTasks?: { session: string; tasks: string[] };
 }

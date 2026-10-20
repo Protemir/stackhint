@@ -2,6 +2,8 @@
 // Every tool is read-only. Installing is deliberately not exposed: the agent can only
 // prepare a plan and ask the user to run `stackhint install`, which asks for confirmation.
 
+import fs from 'node:fs';
+import path from 'node:path';
 import readline from 'node:readline';
 import type { HostId } from '../types.ts';
 import { openSession, runRecommend } from '../app.ts';
@@ -104,9 +106,26 @@ function hostArg(v: unknown): HostId | 'all' | undefined {
   return v === 'claude' || v === 'codex' || v === 'all' ? v : undefined;
 }
 
+/** The path argument comes from a model: local directories only, no network shares or devices. */
+export function safeProjectPath(p: string | undefined, fallback: string): string | { error: string } {
+  if (p === undefined) return fallback;
+  if (/^(\\\\|\/\/)/.test(p) || /^\\\\\?\\/.test(p) || /^[a-z][a-z0-9+.-]*:\/\//i.test(p) || p.includes('\0')) {
+    return { error: 'path must be a local directory (no network shares or URLs)' };
+  }
+  const resolved = path.resolve(fallback, p);
+  try {
+    if (!fs.statSync(resolved).isDirectory()) return { error: 'path is not a directory' };
+  } catch {
+    return { error: 'path does not exist' };
+  }
+  return resolved;
+}
+
 export async function callTool(name: string, args: Json, deps: ServerDeps = {}): Promise<{ text: string; structured?: Json; isError?: boolean }> {
   const env = deps.env ?? process.env;
-  const root = str(args['path'], 1000) ?? deps.cwd ?? process.cwd();
+  const checked = safeProjectPath(str(args['path'], 1000), deps.cwd ?? process.cwd());
+  if (typeof checked !== 'string') return { text: checked.error, isError: true };
+  const root = checked;
   const md = style('md', false);
   const host = hostArg(args['host']);
   const common = { root, env, ...(deps.platform ? { platform: deps.platform } : {}), ...(host ? { host } : {}) };

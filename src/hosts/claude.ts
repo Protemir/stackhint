@@ -104,13 +104,13 @@ export function readClaudeInventory(projectRoot: string, env: Env = process.env,
       const s = normalizeServer('claude', name, def, 'project', mcpJson);
       if (!s) continue;
       if (disabledMcpjson.has(name)) s.enabled = false;
+      // Claude Code asks each person to approve project servers before using them.
+      else if (!enableAll && !enabledMcpjson.has(name)) s.pendingApproval = true;
       servers.push(s);
     }
   } else if (pj.ok) {
     warnings.push('.mcp.json has no "mcpServers" object');
   }
-  void enableAll;
-  void enabledMcpjson;
 
   // Managed (admin) MCP config takes exclusive control when present.
   const managed = claudeManagedMcpPath(env, platform);

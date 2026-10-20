@@ -116,10 +116,28 @@ export async function readGit(root: string, opts: GitOptions): Promise<GitInfo> 
   if (opts.history) {
     const git = which('git');
     if (git) {
-      const res = await run(git, ['-c', 'core.quotepath=off', 'log', '-n', '200', '--no-merges', '--format=%s'], {
-        cwd: root,
-        timeoutMs: 2500,
-      });
+      // The scanned repository's .git/config is untrusted: switch off everything in it that could
+      // run a program (signature checks via gpg.program, fsmonitor hooks, pagers, textconv).
+      const res = await run(
+        git,
+        [
+          '--no-pager',
+          '-c', 'core.quotepath=off',
+          '-c', 'log.showSignature=false',
+          '-c', 'core.fsmonitor=false',
+          '-c', 'core.untrackedCache=false',
+          '-c', 'gpg.program=false',
+          '-c', 'gpg.ssh.program=false',
+          '-c', 'gpg.x509.program=false',
+          '-c', 'diff.external=',
+          'log', '-n', '200', '--no-merges', '--no-show-signature', '--no-textconv', '--no-ext-diff', '--no-color', '--format=%s',
+        ],
+        {
+          cwd: root,
+          timeoutMs: 2500,
+          env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', GIT_PAGER: 'cat', PAGER: 'cat', GIT_CONFIG_NOSYSTEM: '1' },
+        },
+      );
       if (res.code === 0) {
         info.recentSubjects = res.stdout
           .split(/\r?\n/)

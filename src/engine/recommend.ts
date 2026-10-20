@@ -14,7 +14,7 @@ import type {
   ScoreBreakdown,
 } from '../types.ts';
 import { availabilityFor, hostLabel, primaryEntryFor, serverMatchScore } from '../hosts/inventory.ts';
-import { isLegacy } from '../registry/registry.ts';
+import { isLegacy, isRetired } from '../registry/registry.ts';
 import { platformName } from '../util/paths.ts';
 
 export interface RecommendOptions {
@@ -126,7 +126,7 @@ export function recommend(ctx: ProjectContext, registry: Registry, inv: Inventor
     for (const cap of primary.entry.provides) {
       const list = coveredBy.get(cap) ?? [];
       const label = primary.entry.name.toLowerCase().includes(s.name.toLowerCase()) ? `${primary.entry.name} (${hostLabel(s.host)})` : `${primary.entry.name} as "${s.name}" (${hostLabel(s.host)})`;
-      list.push({ host: s.host, entry: primary.entry, label, legacy: isLegacy(primary.entry), viaCli: false });
+      list.push({ host: s.host, entry: primary.entry, label, legacy: isRetired(primary.entry), viaCli: false });
       coveredBy.set(cap, list);
     }
   }
@@ -134,7 +134,7 @@ export function recommend(ctx: ProjectContext, registry: Registry, inv: Inventor
   const replacing = new Map<string, Reason>();
   for (const list of coveredBy.values()) {
     for (const c of list) {
-      if (!c.legacy || !c.entry.successor) continue;
+      if (!c.legacy || !c.entry.successor) continue; // only retired (deprecated/archived/removed) entries
       if (!replacing.has(c.entry.successor)) {
         replacing.set(c.entry.successor, { signal: 'configured:legacy', strength: 1, weight: 0.9, evidence: [{ source: 'config', detail: `${c.label} is ${c.entry.status}` }] });
       }
@@ -185,16 +185,21 @@ export function recommend(ctx: ProjectContext, registry: Registry, inv: Inventor
 
     // Equivalent capability already present (other entries).
     const overlaps = entry.provides.flatMap((cap) => (coveredBy.get(cap) ?? []).filter((c) => c.entry.id !== entry.id && missingHosts.includes(c.host)));
-    const legacyOverlap = overlaps.filter((o) => o.legacy && (o.entry.successor === entry.id || !o.entry.successor));
+    const legacyOverlap = overlaps.filter((o) => o.legacy && o.entry.successor === entry.id);
     const activeMcpOverlap = overlaps.filter((o) => !o.legacy && !o.viaCli);
     const cliOverlap = overlaps.filter((o) => o.viaCli);
 
     let action: RecommendationAction = 'install';
     let overlap = 1;
-    if (legacyOverlap.some((o) => o.entry.successor === entry.id)) action = 'replace';
-    else if (activeMcpOverlap.length > 0 && missingHosts.every((h) => activeMcpOverlap.some((o) => o.host === h))) {
+    // An equivalent tool counts as a duplicate only if it covers everything this one provides.
+    const fullyCovered = (h: HostId): boolean =>
+      entry.provides.length > 0 && entry.provides.every((cap) => (coveredBy.get(cap) ?? []).some((c) => c.host === h && c.entry.id !== entry.id && !c.legacy && !c.viaCli));
+    if (legacyOverlap.length > 0) action = 'replace';
+    else if (missingHosts.length > 0 && missingHosts.every(fullyCovered)) {
       action = 'use-existing';
       overlap = 0.6;
+    } else if (activeMcpOverlap.length > 0) {
+      overlap = 0.85;
     } else if (cliOverlap.length > 0) {
       overlap = 0.8;
     }
@@ -264,14 +269,15 @@ export function recommend(ctx: ProjectContext, registry: Registry, inv: Inventor
       reasons: rel.reasons,
       whyNow: whyNow(entry, rel.reasons, {
         legacyOverlap: uniq(legacyOverlap.map((o) => o.label)),
-        activeOverlap: uniq(activeMcpOverlap.map((o) => o.label)),
+        activeOverlap: action === 'use-existing' ? uniq(activeMcpOverlap.map((o) => o.label)) : [],
+        partialOverlap: action === 'use-existing' ? [] : uniq(activeMcpOverlap.map((o) => o.label)),
         cliOverlap: uniq(cliOverlap.map((o) => o.label)),
       }),
       breakdown,
       availability,
       uncertainty: [...new Set(uncertainty)],
       alternatives: (entry.alternatives ?? []).filter((a) => entriesById.has(a)),
-      newSignals: rel.reasons.map((r) => r.signal).filter((s) => prev.size > 0 && !prev.has(s) && !s.startsWith('task:')),
+      newSignals: rel.reasons.map((r) => r.signal).filter((s) => prev.size > 0 && !prev.has(s) && !s.startsWith('task:') && ctx.signals[s] !== undefined),
     };
     if (top === undefined) continue;
 
@@ -325,7 +331,7 @@ function evidenceText(r: Reason): string {
   return `${e.detail} (${e.source})`;
 }
 
-function whyNow(entry: RegistryEntry, reasons: Reason[], o: { legacyOverlap: string[]; activeOverlap: string[]; cliOverlap: string[] }): string {
+function whyNow(entry: RegistryEntry, reasons: Reason[], o: { legacyOverlap: string[]; activeOverlap: string[]; partialOverlap: string[]; cliOverlap: string[] }): string {
   const parts: string[] = [];
   if (o.legacyOverlap.length) parts.push(`You still use ${o.legacyOverlap.join(', ')}, which is no longer maintained; this is its replacement.`);
   const seen = new Set<string>();
@@ -340,6 +346,7 @@ function whyNow(entry: RegistryEntry, reasons: Reason[], o: { legacyOverlap: str
   }
   if (facts.length) parts.push(capitalize(facts.join('; ')) + '.');
   if (o.activeOverlap.length) parts.push(`You already have ${o.activeOverlap.join(', ')} for this.`);
+  else if (o.partialOverlap.length) parts.push(`${o.partialOverlap.join(', ')} already covers part of this.`);
   else if (o.cliOverlap.length) parts.push(`${o.cliOverlap.join(', ')} already covers part of this from the shell.`);
   if (!parts.length) parts.push(entry.problem);
   return parts.join(' ');

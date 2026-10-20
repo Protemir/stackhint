@@ -5,11 +5,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { openSession, runRecommend,              } from '../app.js';
+import { findGitDir } from '../context/git.js';
 import { classifyTask } from '../context/task.js';
 import { SignalSet } from '../context/signals.js';
 import { recommend } from '../engine/recommend.js';
 import { Store } from '../state/store.js';
-
+import { homeDir, samePath,          } from '../util/paths.js';
 import { sanitizeLine } from '../util/text.js';
 
 
@@ -28,6 +29,19 @@ import { sanitizeLine } from '../util/text.js';
 
 
 
+
+/**
+ * The project the session belongs to. Claude Code passes CLAUDE_PROJECT_DIR; otherwise use the git
+ * root above the working directory, so a cd into a subfolder does not look like another project.
+ */
+export function projectRootFor(input           , env     )         {
+  if (env['CLAUDE_PROJECT_DIR']) return env['CLAUDE_PROJECT_DIR'];
+  const cwd = input.cwd || process.cwd();
+  const gitDir = findGitDir(cwd);
+  // A dotfiles repository in the home folder is not "the project".
+  if (gitDir && path.basename(gitDir) === '.git' && !samePath(path.dirname(gitDir), homeDir(env))) return path.dirname(gitDir);
+  return cwd;
+}
 
 export function detectHost(input           , env     )                     {
   if (env['CLAUDE_PROJECT_DIR'] || env['CLAUDECODE']) return 'claude';
@@ -74,7 +88,7 @@ export async function sessionStartHook(input           , deps           = {})   
   try {
     const { config } = store.loadConfig();
     if (config.mode === 'manual') return undefined;
-    const root = input.cwd || env['CLAUDE_PROJECT_DIR'] || process.cwd();
+    const root = projectRootFor(input, env);
     const host = deps.host ?? detectHost(input, env);
     const session = await openSession({
       root,
@@ -100,7 +114,9 @@ export async function sessionStartHook(input           , deps           = {})   
     const inProjectCooldown = project.lastHookAt !== undefined && nowMs - Date.parse(project.lastHookAt) < config.projectCooldownHours * 3_600_000;
     const picked = (inProjectCooldown ? fresh.filter((r) => r.newSignals.length > 0) : fresh).slice(0, config.hookMaxItems[mode]);
 
-    project.signals = Object.keys(session.ctx.signals).filter((s) => !s.startsWith('task:') && !s.startsWith('team-mcp:'));
+    const kept = Object.values(session.ctx.signals).filter((s) => !s.id.startsWith('task:') && !s.id.startsWith('team-mcp:'));
+    project.signals = kept.map((s) => s.id);
+    project.strengths = Object.fromEntries(kept.map((s) => [s.id, s.strength]));
     if (picked.length > 0) {
       project.lastHookAt = new Date(nowMs).toISOString();
       for (const r of picked) project.shown[r.id] = new Date(nowMs).toISOString();
@@ -123,7 +139,7 @@ export async function userPromptHook(input           , deps           = {})     
   try {
     const { config } = store.loadConfig();
     if (config.mode !== 'proactive' || !input.prompt) return undefined;
-    const root = input.cwd || env['CLAUDE_PROJECT_DIR'] || process.cwd();
+    const root = projectRootFor(input, env);
     const host = deps.host ?? detectHost(input, env);
     const session          = await openSession({
       root,
@@ -139,7 +155,10 @@ export async function userPromptHook(input           , deps           = {})     
 
     // Project signals come from the last full scan (ids only); the prompt adds task signals.
     const set = new SignalSet();
-    for (const id of project.signals) set.add(id, 0.8, { source: '.', detail: 'from the last project scan' });
+    for (const id of project.signals) {
+      const strength = project.strengths?.[id];
+      set.add(id, typeof strength === 'number' ? Math.max(0, Math.min(1, strength)) : 0.5, { source: '.', detail: 'from the last project scan' });
+    }
     const tasks = classifyTask(input.prompt, set);
     if (!tasks.some((t) => t.startsWith('task:'))) return undefined;
     const signals                         = set.toRecord();

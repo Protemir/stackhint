@@ -118,17 +118,19 @@ export async function analyzeProject(rootInput: string, opts: AnalyzeOptions = {
     if (isSecretFile(f.name)) return undefined;
     if (filesRead >= READ_FILES || bytesRead >= READ_BYTES) return undefined;
     const t = readText(f.abs, max);
-    if (t !== undefined) {
-      filesRead++;
-      bytesRead += t.length;
-    }
-    return t;
+    if (t === undefined) return undefined;
+    filesRead++;
+    bytesRead += t.length;
+    // Repository files are untrusted: cap line length so no detector regex can run long.
+    if (t.length <= 2000) return t;
+    const lines = t.split('\n');
+    return lines.some((l) => l.length > 2000) ? lines.map((l) => (l.length > 2000 ? l.slice(0, 2000) : l)).join('\n') : t;
   };
   const ev = (f: FileInfo, detail: string) => ({ source: f.rel, detail });
 
-  // ---- language by extension ----
+  // ---- language by extension (sample and fixture folders do not count) ----
   const extCount = new Map<string, number>();
-  for (const f of files) extCount.set(f.ext, (extCount.get(f.ext) ?? 0) + 1);
+  for (const f of files) if (!isSampleDir(f.rel)) extCount.set(f.ext, (extCount.get(f.ext) ?? 0) + 1);
   const LANGS: Array<[string, string[]]> = [
     ['lang:csharp', ['.cs']],
     ['lang:fsharp', ['.fs']],
@@ -152,12 +154,19 @@ export async function analyzeProject(rootInput: string, opts: AnalyzeOptions = {
   }
   const uiFiles = ['.tsx', '.jsx', '.vue', '.svelte'].reduce((acc, e) => acc + (extCount.get(e) ?? 0), 0);
   if (uiFiles >= 5) set.add('tech:frontend', 0.7, { source: '.', detail: `${uiFiles} UI component files` });
+  // Plain static sites: HTML pages with CSS or scripts.
+  const htmlFiles = (extCount.get('.html') ?? 0) + (extCount.get('.htm') ?? 0);
+  const styleOrScript = ['.css', '.scss', '.js', '.mjs'].reduce((acc, e) => acc + (extCount.get(e) ?? 0), 0);
+  if (htmlFiles >= 3 && styleOrScript >= 1) set.add('tech:frontend', 0.6, { source: '.', detail: `${htmlFiles} HTML pages` });
 
-  const applyPackages = (f: FileInfo, rules: PackageRule[], names: Iterable<string>, kind: string): void => {
+  const applyPackages = (target: SignalSink, f: FileInfo, rules: PackageRule[], names: Iterable<string>, kind: string): void => {
     for (const name of names) {
-      for (const [id, strength] of matchPackage(rules, name)) set.add(id, strength, ev(f, `${kind} ${name}`));
+      for (const [id, strength] of matchPackage(rules, name)) target.add(id, strength, ev(f, `${kind} ${name}`));
     }
   };
+  // Sample/fixture folders collect into their own set; it is merged with a hard cap below.
+  const sampleSet = new SignalSet();
+  const sampleView: SignalSink = sampleSet;
 
   // ---- per-file detectors ----
   let k8sYamlChecked = 0;
@@ -166,50 +175,52 @@ export async function analyzeProject(rootInput: string, opts: AnalyzeOptions = {
   const scaffold = new Map<string, number>();
 
   for (const f of files) {
+    const sample = isSampleDir(f.rel);
+    const target: SignalSink = sample ? sampleView : set;
     const n = f.lower;
     const relLower = f.rel.toLowerCase();
-    const migrationDir = migrationGroup(f.rel);
+    const migrationDir = sample ? undefined : migrationGroup(f.rel);
     if (migrationDir) bump(migrationDirs, migrationDir);
 
     // .NET
     if (f.ext === '.csproj' || f.ext === '.fsproj' || f.ext === '.vbproj') {
-      set.add('tech:dotnet', 0.95, ev(f, 'project file'));
-      if (f.ext === '.csproj') set.add('lang:csharp', 0.9, ev(f, 'C# project'));
+      target.add('tech:dotnet', 0.95, ev(f, 'project file'));
+      if (f.ext === '.csproj') target.add('lang:csharp', 0.9, ev(f, 'C# project'));
       const t = read(f);
       if (t) {
         if (/Sdk\s*=\s*"Microsoft\.NET\.Sdk\.Web"/i.test(t)) {
-          set.add('tech:aspnetcore', 0.9, ev(f, 'ASP.NET Core web SDK'));
-          set.add('api:rest', 0.6, ev(f, 'ASP.NET Core web SDK'));
+          target.add('tech:aspnetcore', 0.9, ev(f, 'ASP.NET Core web SDK'));
+          target.add('api:rest', 0.6, ev(f, 'ASP.NET Core web SDK'));
         }
-        if (/Sdk\s*=\s*"Aspire\.AppHost\.Sdk/i.test(t)) set.add('tech:aspire', 0.9, ev(f, '.NET Aspire app host'));
-        applyPackages(f, NUGET, nugetPackages(t), 'package');
-        if (/\.tests?\.(cs|fs)proj$/i.test(f.name) || /<IsTestProject>\s*true/i.test(t)) set.add('test:unit', 0.8, ev(f, 'test project'));
+        if (/Sdk\s*=\s*"Aspire\.AppHost\.Sdk/i.test(t)) target.add('tech:aspire', 0.9, ev(f, '.NET Aspire app host'));
+        applyPackages(target, f, NUGET, nugetPackages(t), 'package');
+        if (/\.tests?\.(cs|fs)proj$/i.test(f.name) || /<IsTestProject>\s*true/i.test(t)) target.add('test:unit', 0.8, ev(f, 'test project'));
       }
       continue;
     }
     if (f.ext === '.sln' || f.ext === '.slnx') {
-      set.add('tech:dotnet', 0.9, ev(f, 'solution file'));
+      target.add('tech:dotnet', 0.9, ev(f, 'solution file'));
       continue;
     }
     if (n === 'directory.packages.props' || n === 'directory.build.props' || n === 'packages.config') {
-      set.add('tech:dotnet', 0.6, ev(f, f.name));
+      target.add('tech:dotnet', 0.6, ev(f, f.name));
       const t = read(f);
-      if (t) applyPackages(f, NUGET, nugetPackages(t), 'package');
+      if (t) applyPackages(target, f, NUGET, nugetPackages(t), 'package');
       continue;
     }
     if (n === 'global.json' || n === 'nuget.config' || n === 'dotnet-tools.json') {
-      set.add('tech:dotnet', 0.6, ev(f, f.name));
+      target.add('tech:dotnet', 0.6, ev(f, f.name));
       continue;
     }
     if (/^appsettings(\.[a-z0-9_-]+)?\.json$/.test(n)) {
-      set.add('tech:dotnet', 0.4, ev(f, f.name));
+      target.add('tech:dotnet', 0.4, ev(f, f.name));
       const t = read(f);
-      if (t) detectAppSettings(f, t, set);
+      if (t) detectAppSettings(f, t, target);
       continue;
     }
     if (f.ext === '.cs') {
       const m = /^[A-Za-z0-9]+(Controller|Handler|Command|Query|Endpoint|Validator)\.cs$/.exec(f.name);
-      if (m && m[1]) bump(scaffold, `*${m[1]}.cs`);
+      if (m && m[1] && !sample) bump(scaffold, `*${m[1]}.cs`);
       continue;
     }
 
@@ -217,7 +228,7 @@ export async function analyzeProject(rootInput: string, opts: AnalyzeOptions = {
     if (n === 'package.json') {
       const t = read(f);
       if (!t) continue;
-      set.add('tech:node', 0.9, ev(f, 'package.json'));
+      target.add('tech:node', 0.9, ev(f, 'package.json'));
       try {
         const pkg = JSON.parse(t) as Record<string, unknown>;
         const names = new Set<string>();
@@ -225,14 +236,14 @@ export async function analyzeProject(rootInput: string, opts: AnalyzeOptions = {
           const deps = pkg[key];
           if (deps && typeof deps === 'object') for (const d of Object.keys(deps as object)) names.add(d);
         }
-        applyPackages(f, NPM, names, 'dependency');
+        applyPackages(target, f, NPM, names, 'dependency');
       } catch {
         warnings.push(`could not parse ${f.rel}`);
       }
       continue;
     }
     if (n === 'schema.prisma') {
-      set.add('orm:prisma', 0.9, ev(f, 'Prisma schema'));
+      target.add('orm:prisma', 0.9, ev(f, 'Prisma schema'));
       const t = read(f);
       const m = t ? /provider\s*=\s*"(postgresql|postgres|mysql|sqlserver|sqlite|mongodb|cockroachdb)"/.exec(t) : null;
       if (m && m[1]) {
@@ -241,70 +252,70 @@ export async function analyzeProject(rootInput: string, opts: AnalyzeOptions = {
           sqlserver: 'db:sqlserver', sqlite: 'db:sqlite', mongodb: 'db:mongodb',
         };
         const id = map[m[1]];
-        if (id) set.add(id, 0.85, ev(f, `Prisma datasource ${m[1]}`));
+        if (id) target.add(id, 0.85, ev(f, `Prisma datasource ${m[1]}`));
       }
       continue;
     }
     if (/^(playwright)\.config\.(ts|js|mjs|cjs|mts)$/.test(n)) {
-      set.add('test:e2e', 0.95, ev(f, 'Playwright config'));
-      set.add('tool:playwright', 0.95, ev(f, 'Playwright config'));
+      target.add('test:e2e', 0.95, ev(f, 'Playwright config'));
+      target.add('tool:playwright', 0.95, ev(f, 'Playwright config'));
       continue;
     }
     if (/^cypress\.config\.(ts|js|mjs|cjs)$/.test(n) || n === 'cypress.json') {
-      set.add('test:e2e', 0.9, ev(f, 'Cypress config'));
+      target.add('test:e2e', 0.9, ev(f, 'Cypress config'));
       continue;
     }
     if (/^(jest|vitest)\.config\.(ts|js|mjs|cjs|mts|json)$/.test(n)) {
-      set.add('test:unit', 0.85, ev(f, f.name));
+      target.add('test:unit', 0.85, ev(f, f.name));
       continue;
     }
 
     // Python
     if (/^requirements[\w.-]*\.txt$/.test(n) || n === 'constraints.txt') {
-      set.add('lang:python', 0.85, ev(f, f.name));
+      target.add('lang:python', 0.85, ev(f, f.name));
       const t = read(f);
-      if (t) applyPackages(f, PYPI, pythonRequirements(t), 'requirement');
+      if (t) applyPackages(target, f, PYPI, pythonRequirements(t), 'requirement');
       continue;
     }
     if (n === 'pyproject.toml' || n === 'pipfile' || n === 'setup.py' || n === 'setup.cfg' || n === 'environment.yml') {
-      set.add('lang:python', 0.85, ev(f, f.name));
+      target.add('lang:python', 0.85, ev(f, f.name));
       const t = read(f);
-      if (t) applyPackages(f, PYPI, pythonManifestNames(t, f.name), 'dependency');
+      if (t) applyPackages(target, f, PYPI, pythonManifestNames(t, f.name), 'dependency');
       continue;
     }
     if (n === 'pytest.ini' || n === 'conftest.py' || n === 'tox.ini') {
-      set.add('test:unit', 0.8, ev(f, f.name));
+      target.add('test:unit', 0.8, ev(f, f.name));
       continue;
     }
-    if (n === 'alembic.ini') set.add('db:sql', 0.4, ev(f, 'Alembic migrations'));
+    if (n === 'alembic.ini') target.add('db:sql', 0.4, ev(f, 'Alembic migrations'));
 
     // Go / Rust / JVM / PHP / Ruby
     if (n === 'go.mod') {
-      set.add('lang:go', 0.95, ev(f, 'go.mod'));
+      target.add('lang:go', 0.95, ev(f, 'go.mod'));
       const t = read(f);
-      if (t) applyPackages(f, GO, goModules(t), 'module');
+      if (t) applyPackages(target, f, GO, goModules(t), 'module');
       continue;
     }
     if (n === 'cargo.toml') {
-      set.add('lang:rust', 0.95, ev(f, 'Cargo.toml'));
+      target.add('lang:rust', 0.95, ev(f, 'Cargo.toml'));
       const t = read(f);
-      if (t) applyPackages(f, CARGO, cargoDeps(t), 'crate');
+      if (t) applyPackages(target, f, CARGO, cargoDeps(t), 'crate');
       continue;
     }
     if (n === 'pom.xml' || n === 'build.gradle' || n === 'build.gradle.kts') {
-      set.add(n.endsWith('.kts') ? 'lang:kotlin' : 'lang:java', 0.85, ev(f, f.name));
+      target.add(n.endsWith('.kts') ? 'lang:kotlin' : 'lang:java', 0.85, ev(f, f.name));
       const t = read(f);
-      if (t) applyPackages(f, MAVEN, jvmCoordinates(t), 'artifact');
+      if (t) applyPackages(target, f, MAVEN, jvmCoordinates(t), 'artifact');
       continue;
     }
     if (n === 'composer.json') {
-      set.add('lang:php', 0.9, ev(f, 'composer.json'));
+      target.add('lang:php', 0.9, ev(f, 'composer.json'));
       const t = read(f);
       if (t) {
         try {
           const c = JSON.parse(t) as Record<string, unknown>;
           const names = [...Object.keys((c['require'] as object) ?? {}), ...Object.keys((c['require-dev'] as object) ?? {})];
-          applyPackages(f, COMPOSER, names, 'package');
+          applyPackages(target, f, COMPOSER, names, 'package');
         } catch {
           /* ignore */
         }
@@ -312,196 +323,205 @@ export async function analyzeProject(rootInput: string, opts: AnalyzeOptions = {
       continue;
     }
     if (n === 'gemfile') {
-      set.add('lang:ruby', 0.9, ev(f, 'Gemfile'));
+      target.add('lang:ruby', 0.9, ev(f, 'Gemfile'));
       const t = read(f);
-      if (t) applyPackages(f, GEMS, [...t.matchAll(/^\s*gem\s+['"]([^'"]+)['"]/gm)].map((m) => m[1] as string), 'gem');
+      if (t) applyPackages(target, f, GEMS, [...t.matchAll(/^[ \t]*gem[ \t]+['"]([^'"\n]{1,100})['"]/gm)].map((m) => m[1] as string), 'gem');
       continue;
     }
     // Containers
     if (n === 'dockerfile' || n.endsWith('.dockerfile') || n.startsWith('dockerfile.') || n === 'containerfile') {
-      set.add('infra:docker', 0.9, ev(f, 'Dockerfile'));
+      target.add('infra:docker', 0.9, ev(f, 'Dockerfile'));
       continue;
     }
     if (n === '.dockerignore') {
-      set.add('infra:docker', 0.5, ev(f, '.dockerignore'));
+      target.add('infra:docker', 0.5, ev(f, '.dockerignore'));
       continue;
     }
     if (/^(docker-)?compose([.-][\w.-]+)?\.ya?ml$/.test(n)) {
-      set.add('infra:docker', 0.9, ev(f, 'Compose file'));
-      set.add('infra:compose', 0.9, ev(f, 'Compose file'));
+      target.add('infra:docker', 0.9, ev(f, 'Compose file'));
+      target.add('infra:compose', 0.9, ev(f, 'Compose file'));
       const t = read(f);
       if (t) {
-        for (const m of t.matchAll(/^\s*image:\s*["']?([^\s"'#]+)/gm)) {
+        for (const m of t.matchAll(/^[ \t]*image:[ \t]*["']?([^\s"'#]{1,200})/gm)) {
           const image = (m[1] as string).toLowerCase();
           const bare = image.replace(/[:@].*$/, '');
           for (const [re, sigs] of IMAGES) {
-            if (re.test(bare)) for (const [id, s] of sigs) set.add(id, s, ev(f, `service image ${image}`));
+            if (re.test(bare)) for (const [id, s] of sigs) target.add(id, s, ev(f, `service image ${image}`));
           }
         }
       }
       continue;
     }
     if (n === 'chart.yaml') {
-      set.add('infra:helm', 0.9, ev(f, 'Helm chart'));
-      set.add('infra:kubernetes', 0.7, ev(f, 'Helm chart'));
+      target.add('infra:helm', 0.9, ev(f, 'Helm chart'));
+      target.add('infra:kubernetes', 0.7, ev(f, 'Helm chart'));
       continue;
     }
     if (n === 'kustomization.yaml' || n === 'kustomization.yml' || n === 'skaffold.yaml' || n === 'tiltfile') {
-      set.add('infra:kubernetes', 0.8, ev(f, f.name));
+      target.add('infra:kubernetes', 0.8, ev(f, f.name));
       // fallthrough to YAML checks for Flux kustomizations
     }
 
     // CI
     if (/^\.github\/workflows\/[^/]+\.ya?ml$/.test(relLower)) {
-      set.add('ci:github-actions', 0.95, ev(f, 'GitHub Actions workflow'));
-      set.add('vcs:github', 0.6, ev(f, 'GitHub Actions workflow'));
+      target.add('ci:github-actions', 0.95, ev(f, 'GitHub Actions workflow'));
+      target.add('vcs:github', 0.6, ev(f, 'GitHub Actions workflow'));
       const t = read(f);
-      if (t) detectCiContent(f, t, set);
+      if (t) detectCiContent(f, t, target);
       continue;
     }
     if (/^\.github\/(pull_request_template\.md|codeowners|dependabot\.ya?ml|issue_template\/.+)$/.test(relLower)) {
-      set.add('vcs:github', 0.5, ev(f, f.name));
+      target.add('vcs:github', 0.5, ev(f, f.name));
       if (relLower.includes('pull_request_template')) {
         const t = read(f, 64 * 1024);
-        if (t) detectTrackerLinks(f, t, set, 0.7);
+        if (t) detectTrackerLinks(f, t, target, 0.7);
       }
       continue;
     }
     if (n === '.gitlab-ci.yml' || relLower.startsWith('.gitlab/')) {
-      set.add('ci:gitlab-ci', n === '.gitlab-ci.yml' ? 0.95 : 0.5, ev(f, f.name));
-      set.add('vcs:gitlab', 0.6, ev(f, f.name));
+      target.add('ci:gitlab-ci', n === '.gitlab-ci.yml' ? 0.95 : 0.5, ev(f, f.name));
+      target.add('vcs:gitlab', 0.6, ev(f, f.name));
       const t = n === '.gitlab-ci.yml' ? read(f) : undefined;
-      if (t) detectCiContent(f, t, set);
+      if (t) detectCiContent(f, t, target);
       continue;
     }
     if (n === 'azure-pipelines.yml' || n === 'azure-pipelines.yaml' || /^\.azure-?pipelines\//.test(relLower) || relLower.startsWith('.azuredevops/')) {
-      set.add('ci:azure-pipelines', 0.95, ev(f, f.name));
-      set.add('vcs:azure-repos', 0.4, ev(f, f.name));
+      target.add('ci:azure-pipelines', 0.95, ev(f, f.name));
+      target.add('vcs:azure-repos', 0.4, ev(f, f.name));
       const t = read(f);
-      if (t) detectCiContent(f, t, set);
+      if (t) detectCiContent(f, t, target);
       continue;
     }
     if (/^\.circleci\/config\.ya?ml$/.test(relLower)) {
-      set.add('ci:circleci', 0.95, ev(f, 'CircleCI config'));
+      target.add('ci:circleci', 0.95, ev(f, 'CircleCI config'));
       continue;
     }
     if (n === 'jenkinsfile' || n.endsWith('.jenkinsfile')) {
-      set.add('ci:jenkins', 0.95, ev(f, 'Jenkinsfile'));
+      target.add('ci:jenkins', 0.95, ev(f, 'Jenkinsfile'));
       continue;
     }
     if (/^\.buildkite\/.+\.ya?ml$/.test(relLower) || n === 'buildkite.yml' || n === 'buildkite.yaml') {
-      set.add('ci:buildkite', 0.95, ev(f, 'Buildkite pipeline'));
+      target.add('ci:buildkite', 0.95, ev(f, 'Buildkite pipeline'));
       continue;
     }
     if (n === 'bitbucket-pipelines.yml') {
-      set.add('ci:bitbucket', 0.95, ev(f, 'Bitbucket Pipelines'));
-      set.add('vcs:bitbucket', 0.6, ev(f, 'Bitbucket Pipelines'));
+      target.add('ci:bitbucket', 0.95, ev(f, 'Bitbucket Pipelines'));
+      target.add('vcs:bitbucket', 0.6, ev(f, 'Bitbucket Pipelines'));
       continue;
     }
 
     // IaC and clouds
     if (f.ext === '.tf' || f.ext === '.tfvars' || n === 'terragrunt.hcl') {
-      set.add('infra:terraform', 0.9, ev(f, 'Terraform'));
+      target.add('infra:terraform', 0.9, ev(f, 'Terraform'));
       if (f.ext === '.tf') {
         const t = read(f, 128 * 1024);
-        if (t) detectTerraformProviders(f, t, set);
+        if (t) detectTerraformProviders(f, t, target);
       }
       continue;
     }
     if (f.ext === '.bicep' || n === 'azure.yaml') {
-      set.add('cloud:azure', 0.9, ev(f, f.name));
+      target.add('cloud:azure', 0.9, ev(f, f.name));
       continue;
     }
     if (n === 'cdk.json') {
-      set.add('cloud:aws', 0.85, ev(f, 'AWS CDK'));
+      target.add('cloud:aws', 0.85, ev(f, 'AWS CDK'));
       continue;
     }
     if (n === 'serverless.yml' || n === 'serverless.yaml') {
-      set.add('cloud:aws', 0.6, ev(f, 'Serverless Framework'));
+      target.add('cloud:aws', 0.6, ev(f, 'Serverless Framework'));
       continue;
     }
     if (n === 'samconfig.toml') {
-      set.add('cloud:aws', 0.85, ev(f, 'AWS SAM'));
+      target.add('cloud:aws', 0.85, ev(f, 'AWS SAM'));
       continue;
     }
     if (n === 'cloudbuild.yaml' || n === 'cloudbuild.yml') {
-      set.add('cloud:gcp', 0.8, ev(f, 'Cloud Build'));
+      target.add('cloud:gcp', 0.8, ev(f, 'Cloud Build'));
       continue;
     }
     if (n === 'firebase.json' || n === '.firebaserc') {
-      set.add('db:firebase', 0.9, ev(f, f.name));
-      set.add('cloud:gcp', 0.4, ev(f, f.name));
+      target.add('db:firebase', 0.9, ev(f, f.name));
+      target.add('cloud:gcp', 0.4, ev(f, f.name));
       continue;
     }
     if (/^wrangler\.(toml|json|jsonc)$/.test(n)) {
-      set.add('cloud:cloudflare', 0.95, ev(f, f.name));
+      target.add('cloud:cloudflare', 0.95, ev(f, f.name));
       continue;
     }
     if (n === 'vercel.json') {
-      set.add('cloud:vercel', 0.9, ev(f, 'vercel.json'));
+      target.add('cloud:vercel', 0.9, ev(f, 'vercel.json'));
       continue;
     }
     if (relLower === 'supabase/config.toml') {
-      set.add('db:supabase', 0.95, ev(f, 'Supabase project'));
-      set.add('db:postgres', 0.5, ev(f, 'Supabase project'));
+      target.add('db:supabase', 0.95, ev(f, 'Supabase project'));
+      target.add('db:postgres', 0.5, ev(f, 'Supabase project'));
       continue;
     }
 
     // API
     if (/^(openapi|swagger)([.-][\w.-]*)?\.(ya?ml|json)$/.test(n) || /(^|\/)openapi\/[^/]+\.(ya?ml|json)$/.test(relLower)) {
-      set.add('api:openapi', 0.9, ev(f, 'OpenAPI document'));
-      set.add('api:rest', 0.6, ev(f, 'OpenAPI document'));
+      target.add('api:openapi', 0.9, ev(f, 'OpenAPI document'));
+      target.add('api:rest', 0.6, ev(f, 'OpenAPI document'));
       continue;
     }
     if (f.ext === '.http' || f.ext === '.rest') {
-      set.add('api:http-files', 0.8, ev(f, 'HTTP request file'));
-      set.add('api:rest', 0.6, ev(f, 'HTTP request file'));
+      target.add('api:http-files', 0.8, ev(f, 'HTTP request file'));
+      target.add('api:rest', 0.6, ev(f, 'HTTP request file'));
       continue;
     }
     if (n.endsWith('.postman_collection.json') || n.endsWith('.postman_environment.json') || relLower.startsWith('postman/') || relLower.startsWith('.postman/')) {
-      set.add('api:postman', 0.9, ev(f, 'Postman collection'));
+      target.add('api:postman', 0.9, ev(f, 'Postman collection'));
       continue;
     }
     if (f.ext === '.proto') {
-      set.add('api:grpc', 0.85, ev(f, 'protobuf'));
+      target.add('api:grpc', 0.85, ev(f, 'protobuf'));
       continue;
     }
     if (f.ext === '.graphql' || f.ext === '.gql') {
-      set.add('api:graphql', 0.85, ev(f, 'GraphQL schema'));
+      target.add('api:graphql', 0.85, ev(f, 'GraphQL schema'));
       continue;
     }
 
     // Quality, observability
     if (n === 'sonar-project.properties' || n === '.sonarcloud.properties') {
-      set.add('quality:sonar', 0.95, ev(f, f.name));
+      target.add('quality:sonar', 0.95, ev(f, f.name));
       continue;
     }
     if (n === '.semgrep.yml' || n === '.semgrep.yaml' || n === '.semgrepignore' || relLower.startsWith('.semgrep/')) {
-      set.add('quality:semgrep', 0.9, ev(f, f.name));
+      target.add('quality:semgrep', 0.9, ev(f, f.name));
       continue;
     }
     if (n === '.snyk') {
-      set.add('quality:snyk', 0.95, ev(f, '.snyk policy'));
+      target.add('quality:snyk', 0.95, ev(f, '.snyk policy'));
       continue;
     }
     if (n === 'sentry.properties' || n === '.sentryclirc' || /^sentry\.(client|server|edge)\.config\.(ts|js|mjs)$/.test(n)) {
-      set.add('obs:sentry', 0.9, ev(f, f.name));
+      target.add('obs:sentry', 0.9, ev(f, f.name));
       continue;
     }
     if (n === 'prometheus.yml' || n === 'prometheus.yaml') {
-      set.add('obs:prometheus', 0.8, ev(f, f.name));
+      target.add('obs:prometheus', 0.8, ev(f, f.name));
       continue;
     }
     if (/(^|\/)grafana\/(provisioning|dashboards)\//.test(relLower)) {
-      set.add('obs:grafana', 0.8, ev(f, 'Grafana provisioning'));
+      target.add('obs:grafana', 0.8, ev(f, 'Grafana provisioning'));
       continue;
     }
 
     // Env examples: key names and URL schemes only, never values.
     if (/^\.env\.(example|sample|template|dist|defaults)$/.test(n) || n === 'env.example' || n === 'example.env') {
       const t = read(f, 64 * 1024);
-      if (t) detectEnvExample(f, t, set);
+      if (t) detectEnvExample(f, t, target);
       continue;
+    }
+
+    // Named files that the generic YAML/Markdown branches below would otherwise swallow.
+    if (n === 'mkdocs.yml' || /^docusaurus\.config\.(js|ts|mjs)$/.test(n) || n === 'docfx.json') {
+      target.add('docs:site', 0.8, ev(f, f.name));
+      continue;
+    }
+    if (n === 'claude.md' || n === 'agents.md') {
+      target.add(n === 'claude.md' ? 'agent:claude-md' : 'agent:agents-md', 0.9, ev(f, f.name));
     }
 
     // YAML manifests: Kubernetes, Argo CD, Flux
@@ -509,10 +529,10 @@ export async function analyzeProject(rootInput: string, opts: AnalyzeOptions = {
       k8sYamlChecked++;
       const t = read(f, 128 * 1024);
       if (t && /^apiVersion:\s*\S+/m.test(t) && /^kind:\s*\S+/m.test(t)) {
-        if (/argoproj\.io\//.test(t)) set.add('infra:argocd', 0.9, ev(f, 'Argo CD manifest'));
-        if (/toolkit\.fluxcd\.io\//.test(t)) set.add('infra:flux', 0.9, ev(f, 'Flux manifest'));
+        if (/argoproj\.io\//.test(t)) target.add('infra:argocd', 0.9, ev(f, 'Argo CD manifest'));
+        if (/toolkit\.fluxcd\.io\//.test(t)) target.add('infra:flux', 0.9, ev(f, 'Flux manifest'));
         if (/^kind:\s*(Deployment|StatefulSet|DaemonSet|Service|Ingress|CronJob|Job|Pod|ConfigMap|Namespace|HorizontalPodAutoscaler|NetworkPolicy|HelmRelease|Kustomization|Application|ServiceAccount|Role|RoleBinding|PersistentVolumeClaim)\b/m.test(t)) {
-          set.add('infra:kubernetes', 0.85, ev(f, 'Kubernetes manifest'));
+          target.add('infra:kubernetes', 0.85, ev(f, 'Kubernetes manifest'));
         }
       }
       continue;
@@ -524,16 +544,15 @@ export async function analyzeProject(rootInput: string, opts: AnalyzeOptions = {
       if (!top) continue;
       mdChecked++;
       const t = read(f, 128 * 1024);
-      if (t) detectTrackerLinks(f, t, set, relLower.startsWith('contributing') ? 0.6 : 0.5);
+      if (t) detectTrackerLinks(f, t, target, relLower.startsWith('contributing') ? 0.6 : 0.5);
       continue;
     }
-    if (n === 'mkdocs.yml' || /^docusaurus\.config\.(js|ts|mjs)$/.test(n) || n === 'docfx.json') {
-      set.add('docs:site', 0.8, ev(f, f.name));
-      continue;
-    }
-    if (n === 'claude.md' || n === 'agents.md') {
-      set.add(n === 'claude.md' ? 'agent:claude-md' : 'agent:agents-md', 0.9, ev(f, f.name));
-    }
+  }
+
+  // Examples describe other projects: however many files they have, they stay weak evidence.
+  for (const sig of Object.values(sampleSet.toRecord())) {
+    const first = sig.evidence[0];
+    if (first) set.atLeast(sig.id, Math.min(0.3, sig.strength * 0.35), { source: first.source, detail: `${first.detail} (in an example or fixture folder)` });
   }
 
   // ---- aggregate detectors ----
@@ -581,6 +600,18 @@ export async function analyzeProject(rootInput: string, opts: AnalyzeOptions = {
   };
 }
 
+/** Where detectors write signals. SignalSet implements it; sample folders get a scaled view. */
+export interface SignalSink {
+  add(id: string, strength: number, evidence: { source: string; detail: string }): void;
+  atLeast(id: string, strength: number, evidence: { source: string; detail: string }): void;
+}
+
+/** Examples, samples and test fixtures describe other projects, not this one. */
+export function isSampleDir(rel: string): boolean {
+  const dir = rel.replace(/\\/g, '/').split('/').slice(0, -1).join('/');
+  return /(^|\/)(examples?|samples?|fixtures?|__fixtures__|testdata|test-data|demos?)(\/|$)/i.test(dir);
+}
+
 function bump(map: Map<string, number>, key: string): void {
   map.set(key, (map.get(key) ?? 0) + 1);
 }
@@ -607,8 +638,8 @@ export function migrationGroup(rel: string): string | undefined {
 
 export function nugetPackages(xml: string): string[] {
   const out = new Set<string>();
-  for (const m of xml.matchAll(/<Package(?:Reference|Version)\b[^>]*\bInclude\s*=\s*"([^"]+)"/gi)) out.add(m[1] as string);
-  for (const m of xml.matchAll(/<package\b[^>]*\bid\s*=\s*"([^"]+)"/gi)) out.add(m[1] as string);
+  for (const m of xml.matchAll(/<Package(?:Reference|Version)\b[^>]{0,300}?\bInclude\s{0,5}=\s{0,5}"([^"]{1,200})"/gi)) out.add(m[1] as string);
+  for (const m of xml.matchAll(/<package\b[^>]{0,300}?\bid\s{0,5}=\s{0,5}"([^"]{1,200})"/gi)) out.add(m[1] as string);
   return [...out];
 }
 
@@ -626,42 +657,53 @@ export function pythonRequirements(text: string): string[] {
 /** Requirement names from a quoted list like ["fastapi>=0.1", "psycopg[binary]"]. */
 function quotedRequirements(list: string): string[] {
   const out: string[] = [];
-  for (const m of list.matchAll(/["']\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*(?:[<>=!~;@ ]|["'])/g)) out.push(normalizePy(m[1] as string));
+  for (const m of list.matchAll(/["'] ?([A-Za-z0-9][A-Za-z0-9._-]{0,100}) ?(?:\[[^\]]{0,100}\])? ?(?:[<>=!~;@ ]|["'])/g)) out.push(normalizePy(m[1] as string));
   return out;
+}
+
+/** Collapse runs of spaces and tabs so that adjacent \s* in the patterns below cannot backtrack. */
+function squeeze(text: string): string {
+  return text.replace(/[ \t]+/g, ' ');
 }
 
 /**
  * Dependency names from pyproject.toml, Pipfile, setup.py, setup.cfg or environment.yml.
  * Only dependency sections are read, so a description that mentions "redis" is not a dependency.
  */
-export function pythonManifestNames(text: string, fileName = 'pyproject.toml'): string[] {
+export function pythonManifestNames(rawText: string, fileName = 'pyproject.toml'): string[] {
   const out = new Set<string>();
   const name = fileName.toLowerCase();
+  const text = squeeze(rawText);
   if (name === 'setup.py') {
-    for (const m of text.matchAll(/(install_requires|requires|extras_require)\s*=\s*([[{][\s\S]*?[\]}])\s*[,)]/g)) {
+    for (const m of text.matchAll(/(install_requires|requires|extras_require) ?= ?([[{][\s\S]{0,5000}?[\]}]) ?[,)]/g)) {
       for (const r of quotedRequirements(m[2] as string)) out.add(r);
     }
     return [...out];
   }
   if (name === 'setup.cfg') {
-    const m = /^install_requires\s*=\s*\n((?:[ \t]+\S.*\n?)+)/m.exec(text);
-    if (m && m[1]) for (const line of m[1].split('\n')) {
-      const r = /^\s*([A-Za-z0-9][A-Za-z0-9._-]*)/.exec(line);
+    const lines = text.split(/\r?\n/);
+    const start = lines.findIndex((l) => /^install_requires ?=/.test(l));
+    for (let i = start + 1; start >= 0 && i < lines.length; i++) {
+      const line = lines[i] as string;
+      if (!/^[ \t]/.test(line) || !line.trim()) break;
+      const r = /^ ?([A-Za-z0-9][A-Za-z0-9._-]{0,100})/.exec(line);
       if (r && r[1]) out.add(normalizePy(r[1]));
     }
     return [...out];
   }
   if (name === 'environment.yml') {
-    const dep = /^dependencies:\s*\n([\s\S]*)/m.exec(text);
-    if (dep && dep[1]) for (const m of dep[1].matchAll(/^\s*-\s*([A-Za-z0-9][A-Za-z0-9._-]*)/gm)) out.add(normalizePy(m[1] as string));
+    const idx = text.search(/^dependencies:/m);
+    if (idx >= 0) for (const m of text.slice(idx).matchAll(/^ ?- ?([A-Za-z0-9][A-Za-z0-9._-]{0,100})/gm)) out.add(normalizePy(m[1] as string));
     return [...out];
   }
   // TOML-shaped files: pyproject.toml and Pipfile.
   let section = '';
   const lines = text.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
-    const line = (lines[i] as string).replace(/\s+#.*$/, '');
-    const header = /^\s*\[+\s*([^\]]+?)\s*\]+\s*$/.exec(line);
+    let line = lines[i] as string;
+    const hash = line.search(/\s#/);
+    if (hash >= 0) line = line.slice(0, hash);
+    const header = /^ ?\[+ ?([^\]]{1,200}?) ?\]+ ?$/.exec(line);
     if (header && header[1]) {
       section = header[1].toLowerCase();
       continue;
@@ -672,7 +714,7 @@ export function pythonManifestNames(text: string, fileName = 'pyproject.toml'): 
       section === 'dev-packages' ||
       section === 'dependency-groups' ||
       /^tool\.poetry\.group\.[^.]+\.dependencies$/.test(section);
-    const kv = /^\s*([A-Za-z0-9][A-Za-z0-9._-]*|"[^"]+")\s*=\s*(.*)$/.exec(line);
+    const kv = /^ ?([A-Za-z0-9][A-Za-z0-9._-]{0,100}|"[^"]{1,100}") ?= ?(.*)$/.exec(line);
     if (!kv || kv[1] === undefined) continue;
     const key = kv[1].replace(/"/g, '');
     let value = kv[2] ?? '';
@@ -712,7 +754,11 @@ function normalizePy(name: string): string {
 
 export function goModules(text: string): string[] {
   const out: string[] = [];
-  for (const m of text.matchAll(/^\s*(?:require\s+)?([a-z0-9.-]+\.[a-z]{2,}\/[^\s]+)\s+v\d/gim)) out.push(m[1] as string);
+  for (const raw of text.split(/\r?\n/)) {
+    const parts = raw.trim().replace(/^require\s+/, '').split(/\s+/);
+    const mod = parts[0] ?? '';
+    if (mod.length <= 200 && /^[a-z0-9.-]{1,100}\.[a-z]{2,20}\/\S+$/i.test(mod) && /^v\d/.test(parts[1] ?? '')) out.push(mod);
+  }
   return out;
 }
 
@@ -739,17 +785,18 @@ export function cargoDeps(text: string): string[] {
 export function jvmCoordinates(text: string): string[] {
   const out = new Set<string>();
   // Maven
-  for (const m of text.matchAll(/<groupId>\s*([^<\s]+)\s*<\/groupId>\s*<artifactId>\s*([^<\s]+)\s*<\/artifactId>/g)) {
+  const t = squeeze(text);
+  for (const m of t.matchAll(/<groupId> ?([^<\s]{1,200}) ?<\/groupId>\s{0,20}<artifactId> ?([^<\s]{1,200}) ?<\/artifactId>/g)) {
     out.add(`${m[1]}:${m[2]}`);
   }
   // Gradle: "group:artifact:version" strings
-  for (const m of text.matchAll(/["']([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+)(?::[^"']*)?["']/g)) out.add(`${m[1]}:${m[2]}`);
+  for (const m of t.matchAll(/["']([A-Za-z0-9_.-]{1,100}):([A-Za-z0-9_.-]{1,100})(?::[^"'\n]{0,100})?["']/g)) out.add(`${m[1]}:${m[2]}`);
   return [...out];
 }
 
 // ---------- content detectors ----------
 
-function detectAppSettings(f: FileInfo, text: string, set: SignalSet): void {
+function detectAppSettings(f: FileInfo, text: string, set: SignalSink): void {
   let json: unknown;
   try {
     json = JSON.parse(stripJsonComments(text));
@@ -832,10 +879,10 @@ function stripJsonComments(text: string): string {
     }
     out += c;
   }
-  return out.replace(/,(\s*[}\]])/g, '$1');
+  return out.replace(/,(\s{0,200}[}\]])/g, '$1');
 }
 
-function detectEnvExample(f: FileInfo, text: string, set: SignalSet): void {
+function detectEnvExample(f: FileInfo, text: string, set: SignalSink): void {
   const KEYS: Array<[RegExp, string, number]> = [
     [/^(POSTGRES_|PG(HOST|USER|DATABASE|PASSWORD|PORT)\b)/, 'db:postgres', 0.6],
     [/^MYSQL_/, 'db:mysql', 0.6],
@@ -864,7 +911,7 @@ function detectEnvExample(f: FileInfo, text: string, set: SignalSet): void {
     [/^ARGOCD_/, 'infra:argocd', 0.6],
   ];
   for (const raw of text.split(/\r?\n/)) {
-    const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(raw);
+    const m = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]{0,100})[ \t]*=[ \t]*(.*)$/.exec(raw.slice(0, 2000));
     if (!m || !m[1]) continue;
     const key = m[1].toUpperCase();
     const value = (m[2] ?? '').trim().replace(/^["']|["']$/g, '');
@@ -882,27 +929,28 @@ function detectEnvExample(f: FileInfo, text: string, set: SignalSet): void {
   }
 }
 
-function detectTrackerLinks(f: FileInfo, text: string, set: SignalSet, base: number): void {
+function detectTrackerLinks(f: FileInfo, text: string, set: SignalSink, base: number): void {
   const once = (re: RegExp, id: string, strength: number, detail: (m: RegExpExecArray) => string): void => {
     const m = re.exec(text);
     if (m) set.add(id, strength, { source: f.rel, detail: detail(m) });
   };
-  once(/\b([a-z0-9-]+)\.atlassian\.net\/(browse|jira|secure)\b/i, 'tracker:jira', 0.85, (m) => `links to ${m[1]}.atlassian.net Jira`);
-  once(/\b([a-z0-9-]+)\.atlassian\.net\/wiki\b/i, 'tracker:confluence', 0.85, (m) => `links to ${m[1]}.atlassian.net Confluence`);
-  once(/\bhttps?:\/\/(jira\.[a-z0-9.-]+\.[a-z]{2,})\//i, 'tracker:jira-server', 0.8, (m) => `links to self-hosted ${m[1]}`);
-  once(/\bhttps?:\/\/(jira\.[a-z0-9.-]+\.[a-z]{2,})\//i, 'tracker:jira', 0.75, (m) => `links to self-hosted ${m[1]}`);
-  once(/\bhttps?:\/\/(confluence\.[a-z0-9.-]+\.[a-z]{2,})\//i, 'tracker:confluence', 0.75, (m) => `links to self-hosted ${m[1]}`);
-  once(/\bhttps?:\/\/(confluence\.[a-z0-9.-]+\.[a-z]{2,})\//i, 'tracker:confluence-server', 0.8, (m) => `links to self-hosted ${m[1]}`);
+  // Quantifiers are bounded (DNS labels are at most 63 characters) so long junk stays fast.
+  once(/\b([a-z0-9-]{1,63})\.atlassian\.net\/(browse|jira|secure)\b/i, 'tracker:jira', 0.85, (m) => `links to ${m[1]}.atlassian.net Jira`);
+  once(/\b([a-z0-9-]{1,63})\.atlassian\.net\/wiki\b/i, 'tracker:confluence', 0.85, (m) => `links to ${m[1]}.atlassian.net Confluence`);
+  once(/\bhttps?:\/\/(jira\.[a-z0-9.-]{1,100}\.[a-z]{2,20})\//i, 'tracker:jira-server', 0.8, (m) => `links to self-hosted ${m[1]}`);
+  once(/\bhttps?:\/\/(jira\.[a-z0-9.-]{1,100}\.[a-z]{2,20})\//i, 'tracker:jira', 0.75, (m) => `links to self-hosted ${m[1]}`);
+  once(/\bhttps?:\/\/(confluence\.[a-z0-9.-]{1,100}\.[a-z]{2,20})\//i, 'tracker:confluence', 0.75, (m) => `links to self-hosted ${m[1]}`);
+  once(/\bhttps?:\/\/(confluence\.[a-z0-9.-]{1,100}\.[a-z]{2,20})\//i, 'tracker:confluence-server', 0.8, (m) => `links to self-hosted ${m[1]}`);
   once(/\bjira\b/i, 'tracker:jira', base * 0.6, () => 'mentions Jira');
-  once(/\blinear\.app\/[a-z0-9-]+\/(issue|project|team)\b/i, 'tracker:linear', 0.85, () => 'links to Linear issues');
+  once(/\blinear\.app\/[a-z0-9-]{1,64}\/(issue|project|team)\b/i, 'tracker:linear', 0.85, () => 'links to Linear issues');
   once(/\bfigma\.com\/(file|design|proto|board)\//i, 'design:figma', 0.8, () => 'links to Figma files');
   once(/\bnotion\.(so|site)\//i, 'docs:notion', 0.6, () => 'links to Notion');
   once(/\bdev\.azure\.com\//i, 'vcs:azure-repos', 0.5, () => 'links to Azure DevOps');
   once(/\bsentry\.io\/(organizations|issues)\//i, 'obs:sentry', 0.5, () => 'links to Sentry');
-  once(/\b(app\.)?getpostman\.com\/|\bpostman\.com\/[a-z0-9-]+\/workspace\//i, 'api:postman', 0.6, () => 'links to Postman');
+  once(/\b(app\.)?getpostman\.com\/|\bpostman\.com\/[a-z0-9-]{1,64}\/workspace\//i, 'api:postman', 0.6, () => 'links to Postman');
 }
 
-function detectCiContent(f: FileInfo, text: string, set: SignalSet): void {
+function detectCiContent(f: FileInfo, text: string, set: SignalSink): void {
   const t = text;
   const add = (re: RegExp, id: string, s: number, detail: string): void => {
     if (re.test(t)) set.add(id, s, { source: f.rel, detail });
@@ -923,7 +971,7 @@ function detectCiContent(f: FileInfo, text: string, set: SignalSet): void {
   add(/playwright (test|install)/, 'test:e2e', 0.8, 'CI runs Playwright');
 }
 
-function detectTerraformProviders(f: FileInfo, text: string, set: SignalSet): void {
+function detectTerraformProviders(f: FileInfo, text: string, set: SignalSink): void {
   const P: Array<[RegExp, string, number]> = [
     [/(provider\s+"aws"|hashicorp\/aws)/, 'cloud:aws', 0.85],
     [/(provider\s+"azurerm"|hashicorp\/azurerm|provider\s+"azuread")/, 'cloud:azure', 0.85],
@@ -975,6 +1023,7 @@ const ISSUE_KEY_STOP = new Set([
   'UTF', 'ISO', 'SHA', 'CVE', 'RFC', 'COVID', 'GPT', 'HTTP', 'TLS', 'SSL', 'MD', 'AES', 'RSA', 'ECMA', 'ES',
   'PEP', 'JSR', 'KB', 'MS', 'X', 'H', 'V', 'IPV', 'WIN', 'NET', 'CSS', 'HTML', 'ARM', 'GHSA', 'PR', 'MR', 'P', 'Q',
   'NUGET', 'NPM', 'ID', 'API', 'UI', 'OS', 'VS', 'SQL', 'JDK', 'K', 'S', 'R', 'PY', 'NODE', 'LTS', 'BUG', 'T', 'TASK',
+  'GH', 'GHE', 'ISSUE', 'FIX', 'FEAT', 'TICKET', 'STORY', 'RELEASE', 'TLS', 'HTTP2', 'PHP', 'JS', 'TS', 'CS',
 ]);
 
 export function detectGit(git: GitInfo, set: SignalSet): void {
@@ -992,7 +1041,8 @@ export function detectGit(git: GitInfo, set: SignalSet): void {
   // Issue keys (PROJ-123) in branch names and commit subjects.
   const keys = new Map<string, Set<string>>();
   const texts = [...git.branches, ...(git.branch ? [git.branch] : []), ...git.recentSubjects];
-  for (const t of texts) {
+  for (const full of texts) {
+    const t = full.slice(0, 300);
     for (const m of t.matchAll(/(?<![A-Za-z0-9])([A-Z][A-Z0-9]{1,9})-(\d{1,6})(?![A-Za-z0-9])/g)) {
       const prefix = m[1] as string;
       if (ISSUE_KEY_STOP.has(prefix)) continue;
@@ -1008,7 +1058,11 @@ export function detectGit(git: GitInfo, set: SignalSet): void {
   }
 
   // Linear-style branch names: user/eng-123-title
-  const linearBranches = git.branches.filter((b) => /^[a-z0-9._-]+\/[a-z]{2,6}-\d+(-|$)/.test(b));
+  const NOT_LINEAR = /^(issue|issues|bug|bugs|gh|pr|fix|feat|feature|hotfix|task|ticket|story|release|v)$/;
+  const linearBranches = git.branches.filter((b) => {
+    const m = /^[a-z0-9._-]{1,60}\/([a-z]{2,6})-\d{1,6}(-|$)/.exec(b);
+    return Boolean(m && m[1] && !NOT_LINEAR.test(m[1]));
+  });
   if (linearBranches.length >= 2) {
     set.add('tracker:linear', 0.5, { source: 'git', detail: `${linearBranches.length} Linear-style branch names` });
   }
@@ -1016,21 +1070,24 @@ export function detectGit(git: GitInfo, set: SignalSet): void {
   // Repeated commit shapes suggest a workflow worth a skill or script.
   const shapes = new Map<string, number>();
   for (const s of git.recentSubjects) {
-    const shape = s
+    // Unicode-aware, so Cyrillic or other non-Latin subjects keep their words.
+    const parts = s
+      .slice(0, 200)
       .toLowerCase()
-      .replace(/[A-Za-z]+-\d+/g, 'KEY')
+      .replace(/\p{L}+-\d+/gu, 'key')
       .replace(/\d+(\.\d+)*/g, '#')
-      .replace(/["'`].*?["'`]/g, 'X')
-      .replace(/[^a-z#\s]/g, ' ')
+      .replace(/["'`][^"'`]{0,100}["'`]/g, 'x')
+      .replace(/[^\p{L}#\s]/gu, ' ')
       .split(/\s+/)
       .filter(Boolean)
-      .slice(0, 3)
-      .join(' ');
-    if (!shape || /^(merge|wip|fix|fixes|update|updated|refactor|chore|cleanup|initial)$/.test(shape)) continue;
+      .slice(0, 3);
+    // A shape needs at least two real words; "# # #" or "fix #" says nothing about the workflow.
+    if (parts.filter((w) => /\p{L}{2,}/u.test(w)).length < 2) continue;
+    const shape = parts.join(' ');
     shapes.set(shape, (shapes.get(shape) ?? 0) + 1);
   }
   for (const [shape, count] of shapes) {
-    if (count < 8 || shape.split(' ').length < 2) continue;
+    if (count < 8) continue;
     if (/^(merge (pull|branch|remote)|update readme|fix typo)/.test(shape)) continue;
     const isRelease = /^(bump|release|version|prepare release|chore release)\b/.test(shape);
     set.add(isRelease ? 'workflow:releases' : 'workflow:repetitive-commits', count >= 15 ? 0.65 : 0.5, {

@@ -165,6 +165,10 @@ export function checkConfig(registry          , inv           , hosts          )
 
 /** Does a configured server carry the markers that distinguish the read-only variant? */
 export function looksReadOnly(s                  , ro            , rw            )          {
+  // Vendors spell read-only in a few common ways; any of them counts.
+  if (s.url && /\/readonly(\/|\?|$)|[?&](read_?only|readonly)=(true|1)/i.test(s.url)) return true;
+  if (s.args.some((a) => /^--?(read-?only|readonly|disable-write)$|^--access-mode=restricted$/i.test(a))) return true;
+  if (Object.entries(s.settings).some(([k, v]) => /read_?only/i.test(k) && /^(true|1)$/i.test(v))) return true;
   if (ro.url && rw.url && ro.url !== rw.url) {
     const marker = ro.url.replace(rw.url, '');
     return Boolean(s.url && marker && s.url.includes(marker.replace(/^[?&]/, '')));

@@ -57,6 +57,7 @@ import { parseToml } from '../util/toml.js';
 
 
 
+
 const defaultRunner         = (exe, argv, opts) => run(exe, argv, { timeoutMs: 120_000, ...(opts.cwd ? { cwd: opts.cwd } : {}), ...(opts.env ? { env: opts.env } : {}) });
 
 function newBackupId(now        , entryId        , host        )         {
@@ -106,9 +107,11 @@ async function applyFile(plan             , ctx              , nowMs        )   
     beforeHash: target.beforeHash,
     afterHash: sha256(target.after),
   };
-  fs.mkdirSync(dir, { recursive: true });
-  if (target.existed) fs.writeFileSync(path.join(dir, 'original'), current, 'utf8');
-  fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n', 'utf8');
+  // Config files can hold tokens: keep backups private to the user.
+  privateDir(ctx.store.backupsDir);
+  privateDir(dir);
+  if (target.existed) fs.writeFileSync(path.join(dir, 'original'), current, { encoding: 'utf8', mode: 0o600 });
+  fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
 
   try {
     writeAtomic(target.path, target.after);
@@ -190,7 +193,7 @@ async function applyCli(plan             , ctx              , nowMs        )    
     verification.push(`\`${path.basename(plan.exe)} ${plan.argv.slice(0, 3).join(' ')}\` exited 0`);
   }
   const id = newBackupId(nowMs, plan.entryId, plan.host);
-  const undoArgv = plan.argv[0] === 'mcp' ? ['mcp', 'remove', plan.serverName, '--scope', plan.scope] : plan.argv[0] === 'plugin' ? ['plugin', 'uninstall', plan.argv[2]          ] : undefined;
+  const undoArgv = plan.argv[0] === 'mcp' ? ['mcp', 'remove', plan.serverName, '--scope', plan.scope] : plan.argv[0] === 'plugin' ? ['plugin', 'uninstall', plan.argv[2]          , '--scope', plan.scope] : undefined;
   const manifest                 = {
     id,
     at: new Date(nowMs).toISOString(),
@@ -200,10 +203,12 @@ async function applyCli(plan             , ctx              , nowMs        )    
     method: 'cli',
     serverName: plan.serverName,
     ...(undoArgv ? { undoArgv, undoExe: plan.exe } : {}),
+    projectRoot: ctx.projectRoot,
   };
   const dir = path.join(ctx.store.backupsDir, id);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n', 'utf8');
+  privateDir(ctx.store.backupsDir);
+  privateDir(dir);
+  fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
   ctx.store.audit('install', { entry: plan.entryId, host: plan.host, scope: plan.scope, method: 'cli', backup: id, server: plan.serverName, access: plan.access });
   return { status: 'applied', message: `Installed ${plan.entryName} for ${plan.host === 'claude' ? 'Claude Code' : 'Codex'}.`, backupId: id, verification, rollback: `stackhint rollback ${id}` };
 }
@@ -259,13 +264,33 @@ export async function rollback(id        , ctx                 )                
     }
   } else {
     if (!m.undoArgv || !m.undoExe) return { status: 'failed', message: 'this install has no automatic undo; remove it with the host CLI' };
-    const description = `Run: ${path.basename(m.undoExe)} ${m.undoArgv.join(' ')}`;
+    const cwd = m.projectRoot && fs.existsSync(m.projectRoot) ? m.projectRoot : undefined;
+    if (m.undoArgv[0] === 'mcp' && m.host === 'claude') {
+      // Remove the server we added, in the project where we added it, and only if it is still there.
+      if (m.scope === 'local' && !cwd) return { status: 'failed', message: 'the project folder of this install no longer exists; remove the server with claude mcp remove' };
+      const inv = readClaudeInventory(cwd ?? process.cwd(), ctx.env ?? process.env);
+      if (!inv.servers.some((s) => s.name === m.serverName && s.scope === m.scope)) {
+        return { status: 'failed', message: `"${m.serverName}" is no longer in Claude Code's ${m.scope} scope; nothing to undo` };
+      }
+    }
+    const description = `Run in ${displayPath(cwd ?? process.cwd())}: ${path.basename(m.undoExe)} ${m.undoArgv.join(' ')}`;
     if (!(await ctx.approve(description))) return { status: 'declined', message: 'Not approved; nothing was changed.' };
-    const r = await (ctx.runner ?? defaultRunner)(m.undoExe, m.undoArgv, { env: ctx.env ?? process.env });
+    const r = await (ctx.runner ?? defaultRunner)(m.undoExe, m.undoArgv, { env: ctx.env ?? process.env, ...(cwd ? { cwd } : {}) });
     if (r.code !== 0) return { status: 'failed', message: `undo command failed (exit ${r.code}): ${redactString(r.stderr).slice(0, 300)}` };
   }
   m.rolledBack = new Date().toISOString();
-  fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(m, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(m, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
   ctx.store.audit('rollback', { backup: id, entry: m.entryId, host: m.host });
   return { status: 'done', message: `Rolled back ${m.entryId} (${m.host}).` };
+}
+
+function privateDir(dir        )       {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (process.platform !== 'win32') {
+    try {
+      fs.chmodSync(dir, 0o700);
+    } catch {
+      /* best effort */
+    }
+  }
 }

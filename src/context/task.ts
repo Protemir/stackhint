@@ -9,9 +9,9 @@ type Rule = [RegExp, Array<[string, number]>];
 const RULES: Rule[] = [
   // categories
   [/\b(pull request|pull-request|\bpr\b|prs\b|code review|review (the|this|my) (pr|change|diff)|merge request|\bmr\b)|пулл?[- ]?реквест|ревью|код[- ]?ревью/i, [['task:pr-review', 0.9]]],
-  [/\b(ticket|issue|backlog|sprint|epic|user story|bug report)s?\b|тикет|задач[аиу]|бэклог|спринт|эпик/i, [['task:issue-tracking', 0.75]]],
-  [/\b(sql|query|queries|database|\bdb\b|index(es)?|explain analyze|deadlock|slow quer|migration|schema)\b|запрос|баз[аеуы] данных|индекс|миграци/i, [['task:db', 0.8]]],
-  [/\b(rest|endpoint|openapi|swagger|api|http|graphql|grpc|webhook)s?\b|эндпоинт|апи(?![а-яё])/i, [['task:api', 0.7]]],
+  [/\b(ticket|issue|backlog|sprint|epic|user story|bug report)s?\b|тикет|бэклог|спринт|эпик/i, [['task:issue-tracking', 0.75]]],
+  [/\b(sql|query|queries|database|db|explain analyze|deadlock|slow quer\w*|migrations?|schema|(add|adding|missing|create|drop|unused) (an? )?index(es)?)\b|запрос|баз[аеуы] данных|индекс|миграци/i, [['task:db', 0.8]]],
+  [/\b(rest ?api|restful|endpoint|openapi|swagger|api|graphql|grpc|webhook)s?\b|эндпоинт|апи(?![а-яё])/i, [['task:api', 0.7]]],
   [/\b(test|tests|testing|e2e|end-to-end|flaky|coverage|unit test|integration test)\b|тест/i, [['task:testing', 0.75]]],
   [/\b(ci|cd|pipeline|github actions|workflow run|build (is )?(failing|broken|red)|deploy(ment)?|release)\b|пайплайн|деплой|сборк[аи] (пада|слома)/i, [['task:ci', 0.75]]],
   [/\b(docker|container|kubernetes|k8s|helm|pod|cluster|kubectl|compose)\b|контейнер|кубер/i, [['task:containers', 0.8]]],
@@ -28,7 +28,8 @@ const RULES: Rule[] = [
   // explicit products
   [/\bjira\b|джир/i, [['tracker:jira', 0.9], ['task:issue-tracking', 0.8]]],
   [/\bconfluence\b|конфлюенс/i, [['tracker:confluence', 0.9]]],
-  [/\blinear\b(?!\s+(algebra|regression|time|scale|search))/i, [['tracker:linear', 0.6]]],
+  // "linear" alone is too common (linear-gradient, linear regression): require tracker context.
+  [/\blinear\b(?!-)(?=.{0,30}\b(issue|ticket|project|board|team|cycle|triage)s?\b)|\b(in|on|from|to) linear\b(?!-)/i, [['tracker:linear', 0.7]]],
   [/\bgithub\b|гитхаб/i, [['vcs:github', 0.9]]],
   [/\bgitlab\b|гитлаб/i, [['vcs:gitlab', 0.9]]],
   [/\bazure devops\b|\bado\b|azure boards|azure pipelines/i, [['vcs:azure-repos', 0.8], ['ci:azure-pipelines', 0.6]]],
@@ -40,7 +41,8 @@ const RULES: Rule[] = [
   [/\bredis\b/i, [['db:redis', 0.85]]],
   [/\belastic(search)?\b|\bkibana\b/i, [['db:elasticsearch', 0.85]]],
   [/\bsupabase\b/i, [['db:supabase', 0.9]]],
-  [/\bneon\b/i, [['db:neon', 0.6]]],
+  // "neon" alone could be a colour; require database context.
+  [/\bneon\b(?=.{0,40}\b(db|database|postgres\w*|branch\w*|serverless|sql)\b)|\b(db|database|postgres\w*|sql)\b.{0,40}\bneon\b/i, [['db:neon', 0.8]]],
   [/\bkubernetes\b|\bk8s\b|кубер/i, [['infra:kubernetes', 0.9]]],
   [/\bhelm\b/i, [['infra:helm', 0.85]]],
   [/\bargo ?cd\b/i, [['infra:argocd', 0.9]]],
@@ -66,7 +68,7 @@ const RULES: Rule[] = [
   [/\bcircle ?ci\b/i, [['ci:circleci', 0.9]]],
   [/\bbuildkite\b/i, [['ci:buildkite', 0.9]]],
   [/\bjenkins\b/i, [['ci:jenkins', 0.9]]],
-  [/\b(\.net|dotnet|c#|csharp|asp\.net|ef core|entity framework|nuget)\b|дотнет/i, [['tech:dotnet', 0.85]]],
+  [/(?<![\w.])(\.net|c#|f#)(?![\w#])|\b(dotnet|csharp|asp\.net|ef core|entity framework|nuget)\b|дотнет/i, [['tech:dotnet', 0.85]]],
 ];
 
 export function classifyTask(text: string, set: SignalSet): string[] {

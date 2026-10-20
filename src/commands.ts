@@ -299,6 +299,10 @@ export async function cmdInstall(
   });
   const st = style(format, io.color);
   if (format !== 'json') io.out(renderPlan(st, plan));
+  else if (!o.yes && !o.dryRun) {
+    // JSON output does not show the plan to a person, so there is nothing to confirm against.
+    throw new UsageError('--format json needs --dry-run (to see the plan) or --yes (to apply it)');
+  }
 
   const approve = async (): Promise<boolean> => {
     if (o.yes) return true;
@@ -593,7 +597,7 @@ export async function cmdSetup(io: IO, o: { host?: string; dryRun?: boolean; yes
 
   // 1) MCP server registration via the normal install flow.
   const entry = selfEntry(nodeExe, cli);
-  const plan = planInstall({ entry, host, projectRoot: s.root, inventory: s.inventory, env: s.env, platform: s.platform, scope: 'user', now: s.now() });
+  const plan = planInstall({ entry, host, projectRoot: s.root, inventory: s.inventory, env: s.env, platform: s.platform, scope: 'user', now: s.now(), trusted: true });
   io.out(renderPlan(style('text', io.color), plan));
 
   // 2) Skill copy with the CLI path filled in.

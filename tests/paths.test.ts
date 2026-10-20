@@ -51,7 +51,8 @@ describe('which', () => {
   it('quotes display commands', () => {
     assert.equal(shellQuote(['claude', 'mcp', 'add', 'x', 'https://a/b']), 'claude mcp add x https://a/b');
     assert.equal(shellQuote(['--header', 'Authorization: Bearer ${T}']), "--header 'Authorization: Bearer ${T}'");
-    assert.equal(shellQuote(["it's"]), '"it\'s"');
+    assert.equal(shellQuote(["it's"]), `'it'"'"'s'`);
+    assert.equal(shellQuote(['$(rm -rf ~)']), "'$(rm -rf ~)'", 'single quotes keep $() literal in sh and PowerShell');
   });
 });
 

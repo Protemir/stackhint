@@ -297,8 +297,15 @@ describe('applying with consent', () => {
     const res = await applyPlan(p, { store, projectRoot: b.project, approve: yes, runner });
     assert.equal(res.status, 'applied');
     assert.deepEqual(calls[0], { exe: '/bin/claude', argv: ['mcp', 'add', '--transport', 'http', '--scope', 'local', 'context7', 'https://mcp.context7.com/mcp'] });
-    const rb = await rollback(res.backupId as string, { store, approve: yes, runner });
-    assert.equal(rb.status, 'done');
+    // The fake runner did not really add it: rollback must notice and refuse to remove anything.
+    const nothing = await rollback(res.backupId as string, { store, approve: yes, runner, env: b.env });
+    assert.equal(nothing.status, 'failed');
+    assert.match(nothing.message, /no longer in Claude Code's local scope/);
+    assert.equal(calls.length, 1);
+    // Simulate what `claude mcp add` writes, then roll back for real.
+    fs.writeFileSync(path.join(b.claudeDir, '.claude.json'), JSON.stringify({ projects: { [b.project]: { mcpServers: { context7: { type: 'http', url: 'https://mcp.context7.com/mcp' } } } } }));
+    const rb = await rollback(res.backupId as string, { store, approve: yes, runner, env: b.env });
+    assert.equal(rb.status, 'done', rb.message);
     assert.deepEqual(calls[1], { exe: '/bin/claude', argv: ['mcp', 'remove', 'context7', '--scope', 'local'] });
   });
 

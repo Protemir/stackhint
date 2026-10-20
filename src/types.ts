@@ -202,6 +202,8 @@ export interface ConfiguredServer {
   args: string[];
   enabled: boolean;
   viaPlugin?: string;
+  /** Claude Code project server that the user has not approved yet. */
+  pendingApproval?: boolean;
   /** Header and env keys whose values look like literal secrets (values are never kept). */
   inlineSecrets: string[];
   /** env.X / header.X -> value, with anything secret-looking replaced by ***. */

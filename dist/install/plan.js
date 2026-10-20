@@ -1,5 +1,6 @@
 // Building an install plan: what would change, where, with which permissions. Reads only.
 
+import fs from 'node:fs';
 import path from 'node:path';
 
 import { availabilityFor, hostLabel } from '../hosts/inventory.js';
@@ -11,6 +12,8 @@ import { displayPath,          } from '../util/paths.js';
 import { redactString } from '../util/redact.js';
 import { parseToml, tomlTable, TomlError,                   } from '../util/toml.js';
 import { claudeAddArgv, claudeServerJson, codexServerTable, resolveSpec, SpecError,                                } from './spec.js';
+
+
 
 
 
@@ -148,6 +151,7 @@ export function planInstall(req             )              {
       ...(req.access ? { access: req.access } : {}),
       ...(req.params ? { params: req.params } : {}),
       ...(req.name ? { name: req.name } : {}),
+      ...(req.trusted ? { trusted: true } : {}),
     });
   } catch (e) {
     plan.blocked = e instanceof SpecError ? e.message : String(e);
@@ -199,6 +203,11 @@ function planClaude(plan             , req             , r              , platfo
 
   if (scope === 'project') {
     const target = path.join(req.projectRoot, '.mcp.json');
+    const escape = leavesProject(req.projectRoot, target);
+    if (escape) {
+      plan.blocked = escape;
+      return;
+    }
     const before = readText(target, 4 * 1024 * 1024);
     const existed = exists(target);
     if (existed && before === undefined) {
@@ -244,6 +253,11 @@ function planCodex(plan             , req             , r              , env    
   }
   plan.scope = scope;
   const target = scope === 'user' ? codexUserConfigPath(env) : path.join(req.projectRoot, '.codex', 'config.toml');
+  const escape = scope === 'project' ? leavesProject(req.projectRoot, target) : undefined;
+  if (escape) {
+    plan.blocked = escape;
+    return;
+  }
   const existed = exists(target);
   const before = readText(target, 4 * 1024 * 1024);
   if (existed && before === undefined) {
@@ -265,6 +279,37 @@ function planCodex(plan             , req             , r              , env    
   if (scope === 'project') plan.sideEffects.push('Codex reads .codex/config.toml only in trusted projects.');
   plan.sideEffects.push('Appends one table; the rest of the file is left byte-for-byte as it is.');
   plan.rollback = 'stackhint rollback (the backup id is printed after the change)';
+}
+
+/**
+ * A project-scope file must really live in the project: a symlinked .codex folder or .mcp.json
+ * pointing elsewhere (for example at ~/.codex) would turn a "project" install into a user one.
+ */
+export function leavesProject(projectRoot        , target        )                     {
+  let realRoot        ;
+  try {
+    realRoot = fs.realpathSync(projectRoot);
+  } catch {
+    return `project folder ${displayPath(projectRoot)} does not exist`;
+  }
+  let p = path.dirname(target);
+  // Walk up to the deepest existing ancestor of the target and resolve it.
+  while (!fs.existsSync(p) && path.dirname(p) !== p) p = path.dirname(p);
+  try {
+    const st = fs.lstatSync(target);
+    if (st.isSymbolicLink()) return `${displayPath(target)} is a symbolic link; refusing to write through it`;
+  } catch {
+    /* does not exist yet: fine */
+  }
+  let realDir        ;
+  try {
+    realDir = fs.realpathSync(p);
+  } catch {
+    return `cannot resolve ${displayPath(p)}`;
+  }
+  const rel = path.relative(realRoot, realDir);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return `${displayPath(target)} resolves outside the project (symbolic link?); refusing to write there`;
+  return undefined;
 }
 
 // ---------------- config editing (pure) ----------------

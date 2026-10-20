@@ -22,7 +22,7 @@ export function style(format: Format, color: boolean): Style {
 /** Escape free text for Markdown: no raw HTML, no link/image syntax injection. */
 function t(s: Style, value: string, max = 600): string {
   const v = sanitize(value, max);
-  return s.md ? v.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/!\[/g, '!\\[') : v;
+  return s.md ? v.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\[/g, '\\[').replace(/\]/g, '\\]') : v;
 }
 
 function code(s: Style, value: string): string {
@@ -309,7 +309,7 @@ export function renderStatus(s: Style, inv: Inventory, hosts: HostId[], root: st
     out.push(`MCP servers (configured, not verified as running): ${servers.length ? '' : 'none'}`);
     for (const x of servers) {
       const what = x.url ? redactString(x.url) : redactArgs([x.command ?? '', ...x.args]).join(' ');
-      out.push(`  - ${x.name} [${x.viaPlugin ? `plugin ${x.viaPlugin}` : x.scope}${x.enabled ? '' : ', disabled'}] ${x.transport}: ${sanitizeLine(what, 140)}`);
+      out.push(`  - ${x.name} [${x.viaPlugin ? `plugin ${x.viaPlugin}` : x.scope}${x.enabled ? '' : ', disabled'}${x.pendingApproval ? ', not approved yet' : ''}] ${x.transport}: ${sanitizeLine(what, 140)}`);
     }
     const plugins = inv.plugins.filter((x) => x.host === h);
     if (plugins.length) out.push(`Plugins: ${plugins.map((p) => `${p.id}${p.enabled ? '' : ' (disabled)'}`).join(', ')}`);

@@ -1,7 +1,7 @@
 // Turning a registry install spec into concrete host configuration.
 
 
-import { paramValueOk } from '../registry/registry.js';
+import { isSafeUrl, paramValueOk, validateServerSpec } from '../registry/registry.js';
 import { which } from '../util/exec.js';
 import { tomlValue,                   } from '../util/toml.js';
 
@@ -21,7 +21,7 @@ export class SpecError extends Error {}
 export function resolveSpec(
   entry               ,
   host        ,
-  opts                                                                     ,
+  opts                                                                                                                                               ,
 )               {
   const install = entry.install;
   if (!install) throw new SpecError(`${entry.name} has no automatic install; follow the guide instead`);
@@ -65,6 +65,10 @@ export function resolveSpec(
     ...(merged.env ? { env: { ...merged.env } } : {}),
     ...(merged.passEnv ? { passEnv: [...merged.passEnv] } : {}),
   };
+  // The final spec (after host overrides and parameters) must pass the same checks as a registry entry.
+  const check = opts.trusted ? {} : validateServerSpec(spec, [], false);
+  if (check.error) throw new SpecError(`invalid server spec after applying parameters: ${check.error}`);
+  if (!opts.trusted && spec.url && !isSafeUrl(spec.url)) throw new SpecError('the URL is not a safe https URL after applying parameters');
   const name = opts.name ?? install.serverName;
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) throw new SpecError('server name may only contain letters, digits, - and _');
   const requiredEnv           = [];
@@ -154,6 +158,11 @@ export function claudeAddArgv(r              , scope                            
 export function tryCommand(host        , r              , configFile        , platform                  = process.platform)         {
   if (host === 'claude') return `claude --mcp-config "${configFile}"`;
   const t = codexServerTable(r, platform);
-  const parts = Object.entries(t).map(([k, v]) => `-c 'mcp_servers.${r.serverName}.${k}=${tomlValue(v)}'`);
+  const parts = Object.entries(t).map(([k, v]) => `-c ${singleQuote(`mcp_servers.${r.serverName}.${k}=${tomlValue(v)}`)}`);
   return `codex ${parts.join(' ')}`;
+}
+
+/** POSIX single quotes; values are validated to contain no quotes or $, so this is also literal in PowerShell. */
+function singleQuote(s        )         {
+  return `'${s.replace(/'/g, `'"'"'`)}'`;
 }

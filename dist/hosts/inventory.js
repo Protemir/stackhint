@@ -100,7 +100,8 @@ export function availabilityFor(entry               , inv           , host      
   if (strong.length > 0) {
     const s = strong[0]                    ;
     const where = s.viaPlugin ? `via plugin ${s.viaPlugin}` : `${s.scope} scope`;
-    return { state: 'configured', detail: `configured as "${s.name}" (${where}); not verified as running`, servers, plugins, skills, executables };
+    const note = s.pendingApproval ? 'waiting for your approval in Claude Code' : 'not verified as running';
+    return { state: 'configured', detail: `configured as "${s.name}" (${where}); ${note}`, servers, plugins, skills, executables };
   }
   const enabledPlugin = plugins.find((p) => p.enabled);
   if (enabledPlugin) return { state: 'configured', detail: `plugin ${enabledPlugin.id} is enabled`, servers, plugins, skills, executables };

@@ -167,7 +167,7 @@ describe('CLI commands', () => {
   it('status and check --strict', () => {
     const b = box({ '.mcp.json': JSON.stringify({ mcpServers: { pg: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-postgres'] } } }) });
     const st = cli(b, ['status', '--host', 'claude']);
-    assert.match(st.out, /pg \[project\] stdio/);
+    assert.match(st.out, /pg \[project, not approved yet\] stdio/);
     const ok = cli(b, ['check']);
     assert.equal(ok.code, 0);
     assert.match(ok.out, /HIGH/);

@@ -58,8 +58,12 @@ export function run(file        , args                   , opts                 
         return;
       }
       exe = process.env['ComSpec'] ?? 'cmd.exe';
-      argv = ['/d', '/s', '/c', `"${[file, ...args].map((a) => `"${a}"`).join(' ')}"`];
+      // Backslashes before a closing quote must be doubled, or they escape the quote.
+      argv = ['/d', '/s', '/c', `"${[file, ...args].map((a) => `"${a.replace(/(\\+)$/, '$1$1')}"`).join(' ')}"`];
     }
+    const env = { ...((opts.env ?? process.env)                     ) };
+    // Never let cmd.exe pick up a node.bat or similar from the scanned repository.
+    if (isBatch) env['NoDefaultCurrentDirectoryInExePath'] = '1';
     execFile(
       exe,
       argv,
@@ -69,7 +73,7 @@ export function run(file        , args                   , opts                 
         windowsHide: true,
         windowsVerbatimArguments: isBatch,
         maxBuffer: 4 * 1024 * 1024,
-        env: (opts.env ?? process.env)                     ,
+        env,
       },
       (error, stdout, stderr) => {
         if (error && typeof (error                         ).code === 'string') {
@@ -83,14 +87,17 @@ export function run(file        , args                   , opts                 
   });
 }
 
-/** Quote argv for display in a POSIX-ish shell. Display only, never executed by us. */
+/**
+ * Quote argv for display. Display only, never executed by us. Single quotes are literal in
+ * POSIX shells and in PowerShell; an embedded quote uses the POSIX '"'"' form (registry and
+ * parameter validation already keep quotes and $ out of these values).
+ */
 export function shellQuote(args                   )         {
   return args
     .map((a) => {
       if (a === '') return "''";
-      if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(a)) return a;
-      if (!a.includes("'")) return `'${a}'`;
-      return `"${a.replace(/(["\\$`])/g, '\\$1')}"`;
+      if (/^[A-Za-z0-9_@+=:,./-]+$/.test(a)) return a;
+      return `'${a.replace(/'/g, `'"'"'`)}'`;
     })
     .join(' ');
 }

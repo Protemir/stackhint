@@ -4,7 +4,7 @@ const SECRET_KEY =
   /(token|secret|passw(or)?d|pwd|api[-_]?key|apikey|auth|bearer|credential|private|session|cookie|dsn|connection[-_]?string|database[-_]?ur[il]|signature|(^|[^a-z])pat($|[^a-z]))/i;
 
 /** A ${VAR} / ${VAR:-default} / $VAR reference, or an empty value: safe to show. */
-const ENV_REFERENCE = /^\s*(\$\{[A-Za-z_][A-Za-z0-9_]*(:-[^}]*)?\}|\$[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z_][A-Za-z0-9_]*%)?\s*$/;
+const ENV_REFERENCE = /^(\$\{[A-Za-z_][A-Za-z0-9_]{0,100}(:-[^}]{0,200})?\}|\$[A-Za-z_][A-Za-z0-9_]{0,100}|%[A-Za-z_][A-Za-z0-9_]{0,100}%)?$/;
 
 const PATTERNS                          = [
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)/g, '***PRIVATE KEY***'],
@@ -17,9 +17,9 @@ const PATTERNS                          = [
   [/\b(AKIA|ASIA)[0-9A-Z]{16}\b/g, '***'],
   [/\bAIza[0-9A-Za-z_-]{35}\b/g, '***'],
   [/\bnpm_[A-Za-z0-9]{30,}\b/g, '***'],
-  [/\bey[A-Za-z0-9_-]{8,}\.ey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '***JWT***'],
-  // scheme://user:password@host -> scheme://user:***@host
-  [/\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]*):[^\s@/]+@/gi, '$1:***@'],
+  [/\bey[A-Za-z0-9_-]{8,2000}\.ey[A-Za-z0-9_-]{8,4000}\.[A-Za-z0-9_-]{8,4000}\b/g, '***JWT***'],
+  // scheme://user:password@host -> scheme://user:***@host (bounded, so long junk stays linear)
+  [/\b([a-z][a-z0-9+.-]{0,30}:\/\/[^\s:/@]{0,200}):[^\s@/]{1,500}@/gi, '$1:***@'],
   // Authorization header values
   [/\b(Bearer|Basic|Token)\s+(?!\$\{)[A-Za-z0-9._~+/=-]{6,}/g, '$1 ***'],
   // key=value pairs in connection strings and query strings
@@ -31,17 +31,19 @@ const PATTERNS                          = [
 
 /** Redact known secret shapes anywhere inside a string. */
 export function redactString(input        )         {
-  let s = input;
+  // Values come from untrusted files; cap the length so no pattern can take long.
+  let s = input.length > 8000 ? input.slice(0, 8000) + '…' : input;
   for (const [re, repl] of PATTERNS) s = s.replace(re, repl);
   return s;
 }
 
 export function isSecretKey(key        )          {
-  return SECRET_KEY.test(key);
+  return key.length <= 200 && SECRET_KEY.test(key);
 }
 
 export function isEnvReference(value        )          {
-  return ENV_REFERENCE.test(value);
+  const v = value.trim();
+  return v.length <= 320 && ENV_REFERENCE.test(v);
 }
 
 /** Redact a value given the key it is stored under. Env references stay visible. */
@@ -49,7 +51,7 @@ export function redactValue(key        , value        )         {
   if (isEnvReference(value)) return value;
   if (isSecretKey(key)) {
     // Keep a scheme-style prefix such as "Bearer ${X}" readable.
-    const m = /^(Bearer|Basic|Token)\s+(.*)$/i.exec(value);
+    const m = /^(Bearer|Basic|Token)\s+(.*)$/i.exec(value.slice(0, 4000));
     if (m && m[2] !== undefined && isEnvReference(m[2])) return value;
     return '***';
   }
@@ -59,7 +61,7 @@ export function redactValue(key        , value        )         {
 /** Does this key/value pair look like a literal secret written into a config file? */
 export function looksLikeLiteralSecret(key        , value        )          {
   if (!value || isEnvReference(value)) return false;
-  const m = /^(Bearer|Basic|Token)\s+(.*)$/i.exec(value);
+  const m = /^(Bearer|Basic|Token)\s+(.*)$/i.exec(value.slice(0, 4000));
   if (m && m[2] !== undefined) return !isEnvReference(m[2]) && m[2].length >= 6;
   if (redactString(value) !== value) return true;
   if (isSecretKey(key)) {
