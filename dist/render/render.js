@@ -22,8 +22,11 @@ export function style(format        , color         )        {
 /** Escape free text for Markdown: no raw HTML, no link/image syntax injection. */
 function t(s       , value        , max = 600)         {
   const v = sanitize(value, max);
-  // Backslash first, so a pre-escaped "\[" cannot turn back into a live link.
-  return s.md ? v.replace(/\\/g, '\\\\').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\[/g, '\\[').replace(/\]/g, '\\]') : v;
+  // Backslashes before punctuation first, so a pre-escaped "\[" cannot turn back into a live link;
+  // other backslashes (Windows paths) stay as they are.
+  return s.md
+    ? v.replace(/\\(?=[!-/:-@[-`{-~])/g, '\\\\').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\[/g, '\\[').replace(/\]/g, '\\]')
+    : v;
 }
 
 function code(s       , value        )         {

@@ -23,6 +23,7 @@ import type {
 import { HOST_IDS } from '../types.ts';
 import { readJson } from '../util/fsx.ts';
 import { looksLikeLiteralSecret } from '../util/redact.ts';
+import { CONTAINER_CLIS, parseRunArgs } from '../util/docker.ts';
 import { sanitize, sanitizeLine } from '../util/text.ts';
 
 const KINDS: EntryKind[] = ['mcp', 'plugin', 'skill', 'cli'];
@@ -49,7 +50,7 @@ const SHELL_META = /[;&|`$<>\\"'%^!\r\n\u0000]/;
 
 /** Control, zero-width and bidi characters: they can disguise what a command really says. */
 // eslint-disable-next-line no-control-regex
-const INVISIBLE = /[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁠-⁤⁦-⁩﻿]/;
+const INVISIBLE = /[\u0000-\u001f\u007f-\u009f\u00ad\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u2069\ufeff]|\udb40[\udc00-\udc7f]/;
 
 /** Literal header and env values: plain words only, no quotes, no $ (no ${VAR} expansion tricks). */
 const SAFE_VALUE = /^[A-Za-z0-9 ._:/=,+@*?~-]{0,200}$/;
@@ -72,7 +73,9 @@ const INSTRUCTION_LIKE =
 function normalizeForScan(s: string): string {
   return s
     .normalize('NFKC')
-    .replace(/\s+/g, ' ') // first: tabs and newlines become spaces, so words are not glued together
+    // Unicode tag characters (U+E0020-E007E) can smuggle invisible ASCII text: read them as ASCII.
+    .replace(/\udb40([\udc20-\udc7e])/g, (_m, lo: string) => String.fromCharCode(lo.charCodeAt(0) - 0xdc00))
+    .replace(/\s+/g, ' ') // tabs and newlines become spaces, so words are not glued together
     .replace(new RegExp(INVISIBLE.source, 'g'), '')
     .replace(/ {2,}/g, ' ')
     .toLowerCase();
@@ -88,7 +91,7 @@ function commandBase(c: string): string {
 }
 
 /** Interpreters and shells under any versioned name. */
-const INTERPRETER_PREFIX = /^(python|pythonw|py|node|nodejs|pwsh|powershell|perl|ruby|php|bash|zsh|ksh|lua|deno|bun|tclsh)([\d._-]|$)/;
+const INTERPRETER_PREFIX = /^(python|pythonw|pyw|py|pypy|ipython|jython|node|nodejs|pwsh|powershell|perl|ruby|php|bash|zsh|ksh|lua|deno|bun|tclsh|rscript)([\d._]|-\d|-(preview|beta|nightly|dev|canary)|$)/;
 
 export interface LoadOptions {
   /** Extra registry files (JSON with an entries array), e.g. from ~/.stackhint/registry.d. */
@@ -246,7 +249,7 @@ export function validateEntry(raw: unknown, ctx: ValidateContext = { origin: 'cu
 
   const texts = textFieldsOf(raw);
   if (!texts) return { errors: ['entry is too large or too deeply nested to check'] };
-  const suspicious = texts.find((t) => INSTRUCTION_LIKE.test(normalizeForScan(t.slice(0, 20_000))));
+  const suspicious = texts.find((t) => INSTRUCTION_LIKE.test(normalizeForScan(t)));
   if (suspicious) return { errors: ['text contains instruction-like content; entry rejected'] };
 
   const docs = str(raw['docs']) ?? '';
@@ -444,19 +447,11 @@ export function validateServerSpec(raw: unknown, params: Param[], partial: boole
         return { error: 'arguments must not carry secrets; use passEnv' };
       }
     }
-    if (typeof raw['command'] === 'string' && /^(docker|podman|nerdctl)$/.test(commandBase(raw['command']))) {
-      for (let i = 0; i < args.length; i++) {
-        const a = (args[i] as string).toLowerCase();
-        const next = (args[i + 1] ?? '').toLowerCase();
-        // Privileges, host namespaces and any mount are refused outright, in every spelling.
-        if (/^--(privileged|cap-add|security-opt|device|volumes-from|group-add)(=|$)/.test(a)) return { error: `docker flag ${a} is not allowed` };
-        if (/^--(pid|net|network|ipc|uts|userns|cgroupns)(=|$)/.test(a) && (a.endsWith('=host') || next === 'host')) return { error: `docker flag ${a} host is not allowed` };
-        if (/^(-v|--volume|--mount|--tmpfs|--env-file)(=|$)/.test(a)) return { error: 'docker mounts and env files are not allowed in the registry' };
-        // Short-flag clusters such as -itv or -tv/:/host also mount volumes.
-        if (/^-[a-z]*v/.test(a) && !a.startsWith('--')) return { error: 'docker mounts are not allowed in the registry' };
-        // A different daemon or context would run the container somewhere else entirely.
-        if (/^(-h|--host|-c|--context)(=|$)/.test(a) || /^-h./.test(a)) return { error: `docker flag ${a} is not allowed` };
-      }
+    // Container CLIs: only `run` with allowlisted flags before the image (no mounts, privileges,
+    // host namespaces, other daemons). Arguments after the image belong to the server.
+    if (typeof raw['command'] === 'string' && CONTAINER_CLIS.test(commandBase(raw['command']))) {
+      const parsed = parseRunArgs(args);
+      if (!parsed.ok) return { error: parsed.error ?? 'container arguments not allowed' };
     }
     spec.args = args;
   }
@@ -467,6 +462,8 @@ export function validateServerSpec(raw: unknown, params: Param[], partial: boole
       if (!ENV_NAME.test(k) || typeof v !== 'string') return { error: `invalid env ${k}` };
       if (looksLikeLiteralSecret(k, v)) return { error: `env ${k} contains a literal secret; use passEnv` };
       if (!SAFE_VALUE.test(v)) return { error: `env ${k} has characters that are not allowed; use passEnv for values from the environment` };
+      // These would point a container CLI at another daemon.
+      if (/^(DOCKER_|CONTAINER_HOST$|CONTAINER_CONNECTION$|PODMAN_|NERDCTL_)/.test(k)) return { error: `env ${k} is not allowed` };
       env[k] = v;
     }
     spec.env = env;
@@ -516,8 +513,12 @@ function validateInstall(raw: unknown, origin: 'builtin' | 'custom' = 'custom'):
         }
         param.pattern = pattern;
       }
+      if (Array.isArray(p['values'])) {
+        const values = (p['values'] as unknown[]).filter((v): v is string => typeof v === 'string' && DEFAULT_PARAM.test(v)).slice(0, 100);
+        if (values.length) param.values = values;
+      }
       if (typeof p['default'] === 'string') {
-        if (!paramValueOk(param, p['default'])) return { error: `param ${param.name}: default does not match its pattern` };
+        if (!paramValueOk(param, p['default'])) return { error: `param ${param.name}: default "${sanitizeLine(p['default'], 60)}" is not an allowed value` };
         param.default = p['default'];
       }
       params.push(param);
@@ -554,8 +555,10 @@ const DEFAULT_PARAM = /^[A-Za-z0-9._:-]{1,100}$/;
 
 export function paramValueOk(param: Param, value: string): boolean {
   if (value.length > 200 || /[\s"'`$;&|<>\\%^!#?]/.test(value) || INVISIBLE.test(value)) return false;
-  const re = param.pattern ? new RegExp(param.pattern) : DEFAULT_PARAM;
-  return re.test(value);
+  if (param.values) return param.values.includes(value);
+  if (param.pattern) return new RegExp(param.pattern).test(value);
+  // Without a pattern: a plain token, or an https URL (checked by isSafeUrl, not by a regex from a file).
+  return DEFAULT_PARAM.test(value) || (/^https:\/\//.test(value) && isSafeUrl(value));
 }
 
 // ---------------- search ----------------

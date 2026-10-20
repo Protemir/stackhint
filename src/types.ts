@@ -74,8 +74,10 @@ export interface Param {
   example: string;
   /** Used when the user does not pass the parameter. */
   default?: string;
-  /** Regex the value must match (anchored). Defaults to a conservative charset. */
+  /** Regex the value must match (anchored); built-in registry only. Defaults to a conservative charset or an https URL. */
   pattern?: string;
+  /** Allowed values (an enum); works for custom registries too. */
+  values?: string[];
 }
 
 /** One concrete way to run an MCP server. Values may contain {param} placeholders. */

@@ -4,7 +4,7 @@
 // eslint-disable-next-line no-control-regex
 const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\u001b[@-Z\\-_]/g;
 // eslint-disable-next-line no-control-regex
-const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩]/g;
+const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u00ad\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u2069\ufeff]|\udb40[\udc00-\udc7f]/g;
 
 /** Strip terminal escapes, control and bidi characters, collapse whitespace, cap length. */
 export function sanitize(value: unknown, max = 600): string {
