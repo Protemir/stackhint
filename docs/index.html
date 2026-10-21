@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stackhint: which MCP servers does your repo need?</title>
+<meta name="description" content="A local CLI and Claude Code / Codex plugin that scans your repository and recommends MCP servers, plugins and skills, with the file that made it think so. Safe installs with a diff, a backup and rollback.">
+<meta property="og:title" content="stackhint: which MCP servers does your repo need?">
+<meta property="og:description" content="Scans your repo and your Claude Code / Codex setup, recommends MCP servers, plugins and skills. Local, offline, asks before it changes anything.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://protemir.github.io/stackhint/">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d1117'/%3E%3Cpath d='M9 11h14M9 16h10M9 21h6' stroke='%2379c0ff' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root { --bg: #ffffff; --fg: #1f2328; --muted: #59636e; --line: #d1d9e0; --code: #f6f8fa; --accent: #0969da; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0d1117; --fg: #e6edf3; --muted: #9198a1; --line: #30363d; --code: #161b22; --accent: #4493f8; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 48px 16px 64px; }
+  h1 { font-size: 2.1rem; line-height: 1.2; margin: 0 0 12px; }
+  h2 { font-size: 1.25rem; margin: 40px 0 8px; }
+  p { margin: 0 0 14px; }
+  .lead { font-size: 1.15rem; color: var(--muted); }
+  a { color: var(--accent); }
+  pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto; margin: 0 0 14px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }
+  img.demo { width: 100%; height: auto; border-radius: 10px; margin: 8px 0 6px; }
+  ul { padding-left: 20px; margin: 0 0 14px; }
+  li { margin: 4px 0; }
+  .links { display: flex; flex-wrap: wrap; gap: 10px 18px; margin: 18px 0 0; }
+  footer { color: var(--muted); font-size: 0.9rem; margin-top: 48px; border-top: 1px solid var(--line); padding-top: 16px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Which MCP servers does your repo actually need?</h1>
+  <p class="lead">stackhint looks at your project and at what Claude Code and Codex already have set up, then recommends MCP servers, plugins and skills, pointing at the file that made it think so. It runs locally, has no dependencies and sends nothing anywhere.</p>
+
+  <p>Try it in any project (Node.js 20+):</p>
+  <pre><code>npx -y github:Protemir/stackhint recommend</code></pre>
+  <p>Or in Claude Code, then ask "which MCP servers would help here?":</p>
+  <pre><code>/plugin marketplace add Protemir/stackhint
+/plugin install stackhint@stackhint</code></pre>
+
+  <img class="demo" src="demo.svg" alt="stackhint recommend on a sample .NET project: Postgres MCP Pro because of Npgsql and 9 migrations, Microsoft Learn because of the ASP.NET Core project, Atlassian Rovo because the README links to Jira" width="940" height="486">
+
+  <h2>What it does</h2>
+  <ul>
+    <li>Reads manifests, compose files, Kubernetes and Terraform, CI, <code>.env.example</code> key names, README links and git history. A README that only says "we might try Kubernetes one day" gets no Kubernetes suggestion.</li>
+    <li>Knows your setup: <code>~/.claude.json</code>, <code>.mcp.json</code>, Claude Code plugins, <code>~/.codex/config.toml</code>, skills. It won't suggest what you already have.</li>
+    <li>Knows 143 tools, checked by hand against vendor docs, including the retired ones: <code>stackhint check</code> tells you to replace the archived Postgres server and why.</li>
+    <li>Installs only after showing the diff, with read-only modes by default, tokens referenced by name, a backup and <code>stackhint rollback</code>.</li>
+    <li>Works for Claude Code and Codex, as a CLI, a plugin with hooks, or a read-only MCP server.</li>
+  </ul>
+
+  <div class="links">
+    <a href="https://github.com/Protemir/stackhint">GitHub</a>
+    <a href="https://github.com/Protemir/stackhint#readme">Docs</a>
+    <a href="https://github.com/Protemir/stackhint/releases">Releases</a>
+    <a href="https://dev.to/protemir/i-built-a-cli-that-tells-you-which-mcp-servers-your-repo-actually-needs-2pb">Why I built it</a>
+  </div>
+
+  <footer>MIT licensed. Made by <a href="https://github.com/Protemir">Protemir</a>. Issues and registry fixes are welcome.</footer>
+</main>
+</body>
+</html>

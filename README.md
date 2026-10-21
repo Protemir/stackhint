@@ -1,39 +1,29 @@
 # stackhint
 
-Tool recommendations for Claude Code and Codex, based on what is actually in your repo.
+[![ci](https://github.com/Protemir/stackhint/actions/workflows/ci.yml/badge.svg)](https://github.com/Protemir/stackhint/actions/workflows/ci.yml) [![release](https://img.shields.io/github/v/release/Protemir/stackhint)](https://github.com/Protemir/stackhint/releases) [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-stackhint reads your project (manifests, compose files, CI, Kubernetes and Terraform files, git remotes and commit history) and the agent configs on your machine, then suggests the MCP servers, plugins, skills and CLIs that fit. It explains why, shows what each one can access, skips what you already have, and can add a server to Claude Code or Codex. It shows the exact change first, and nothing is written until you say yes.
+Which MCP servers, plugins and skills does your repo actually need? stackhint looks at the project and at what Claude Code and Codex already have set up, then tells you, pointing at the file that made it think so. It can also add a server for you, after showing the exact change.
 
-It runs locally, works offline, has no dependencies and sends nothing anywhere.
+It runs locally, has no dependencies and sends nothing anywhere.
 
-```
-$ stackhint recommend --task "orders query is slow"
-stackhint: tools for ~/src/dotnet-shop
-Detected: PostgreSQL, C#, .NET, Redis, GitHub Actions, unit tests, Docker, EF Core, ASP.NET Core, Jira, OpenAPI, GitHub
-Hosts: Claude Code, Codex | 30 files scanned in 63 ms
+Try it in any project (Node.js 20+, nothing to install):
 
-1. Recommendation: Postgres MCP Pro  fit 67/100, confidence high
-Why now: Service image postgres:17 (docker-compose.yml); your task mentions "query"; 9 database migrations (src/Shop.Api/Migrations).
-Permissions: stackhint uses --access-mode=restricted (read-only transactions). Unrestricted mode can run any SQL including DDL.
-Setup: ~10 min, medium effort; auth: connection; community project
-Status: Claude Code: not configured | Codex: not configured
-Alternatives: dbhub, supabase, neon
-Actions:
-  - stackhint install postgres-mcp-pro --host claude - shows the exact change and asks before writing
-  - stackhint try postgres-mcp-pro --host claude - one session without installing
-  - stackhint dismiss postgres-mcp-pro --for 14d - remind me later
-
-2. Recommendation: Microsoft Learn MCP Server  fit 58/100, confidence high
-Why now: Solution file (DotnetShop.sln); ASP.NET Core web SDK (src/Shop.Api/Shop.Api.csproj).
-...
-3. Recommendation: Atlassian Rovo MCP Server  fit 52/100, confidence high
-Why now: Links to acme-demo.atlassian.net Jira (README.md).
-...
-Already set up or covered
-  - GitHub CLI (gh): found on PATH
+```bash
+npx -y github:Protemir/stackhint recommend
 ```
 
-That output comes from [`examples/dotnet-shop`](examples/dotnet-shop), a small sample ASP.NET Core API. Try it yourself with `npm run demo`.
+Or add it to Claude Code and ask "which MCP servers would help here?":
+
+```
+/plugin marketplace add Protemir/stackhint
+/plugin install stackhint@stackhint
+```
+
+![stackhint recommend on a sample .NET project: Postgres MCP Pro because of Npgsql and 9 migrations, Microsoft Learn because of the ASP.NET Core project, Atlassian Rovo because the README links to Jira](docs/demo.svg)
+
+That is the real output on [`examples/dotnet-shop`](examples/dotnet-shop), a small ASP.NET Core API (`npm run demo` reproduces it). Every line in "Why now" points at a file; a README that only says "we might try Kubernetes one day" gets no Kubernetes suggestion.
+
+What it reads: manifests (`*.csproj`, `package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, Gradle, Composer, Gemfile), compose files, Kubernetes and Terraform files, CI, `.env.example` key names, README links and git history, plus your Claude Code and Codex configs. It knows 143 tools (MCP servers, plugins, skills, CLIs), checked by hand against the vendors' docs, including the retired ones, so `stackhint check` can tell you what to replace.
 
 ## Why I built it
 
