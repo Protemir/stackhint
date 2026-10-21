@@ -58,6 +58,21 @@ jobs:
         env:
           STACKHINT_REAL_HOSTS: '1'
 
+  docker:
+    name: container image answers tools/list
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build -t stackhint-mcp .
+      - name: initialize and tools/list over stdio
+        shell: bash
+        run: |
+          out=$(printf '%s\n%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | docker run -i --rm stackhint-mcp)
+          echo "$out"
+          echo "$out" | grep -q '"recommend_tools"'
+
   install-from-github:
     name: install from GitHub (${{ matrix.os }})
     if: github.event_name == 'push'

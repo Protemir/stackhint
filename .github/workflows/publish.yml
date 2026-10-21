@@ -1,0 +1,58 @@
+name: publish
+
+# On every release: build an MCPB bundle (one-click install in Claude Desktop), attach it to
+# the release, and publish stackhint to the official MCP Registry (GitHub OIDC, no secrets).
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to attach the bundle to, e.g. v0.2.1
+        required: true
+
+permissions:
+  contents: write # upload the bundle to the release
+  id-token: write # MCP Registry login via GitHub OIDC
+
+jobs:
+  mcpb-and-registry:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Check that dist/ matches the sources
+        run: node scripts/build.mjs --check
+      - name: Stage the bundle
+        run: node scripts/mcpb.mjs stage out
+      - name: Validate and pack
+        run: |
+          npx -y @anthropic-ai/mcpb@2.1.2 validate out/stage/manifest.json
+          version=$(node -p "require('./package.json').version")
+          npx -y @anthropic-ai/mcpb@2.1.2 pack out/stage "out/stackhint-${version}.mcpb"
+      - name: The bundle starts and lists its tools
+        shell: bash
+        run: |
+          mkdir -p out/unpacked && (cd out/unpacked && unzip -q ../stackhint-*.mcpb)
+          out=$(printf '%s\n%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | node out/unpacked/dist/cli.js mcp)
+          echo "$out" | grep -q '"plan_install"'
+      - name: Attach the bundle to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" out/stackhint-*.mcpb --clobber
+      - name: server.json for the MCP Registry
+        run: node scripts/mcpb.mjs server-json out "$TAG" && cat out/server.json
+      - name: Publish to the MCP Registry
+        working-directory: out
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish
