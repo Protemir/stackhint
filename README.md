@@ -72,6 +72,10 @@ codex plugin marketplace add Protemir/stackhint
 
 Then install `stackhint` from `/plugins`. Codex asks you to approve plugin hooks in `/hooks` before they run.
 
+### Claude Desktop
+
+Download `stackhint-<version>.mcpb` from the [latest release](https://github.com/Protemir/stackhint/releases/latest) and open it: Claude Desktop installs it as an extension. Pass the project folder as `path` when you ask for recommendations. The same server is in the official [MCP Registry](https://registry.modelcontextprotocol.io/) as `io.github.Protemir/stackhint`.
+
 ### Without plugins: MCP server
 
 stackhint can also run as a read-only MCP server with five tools (`recommend_tools`, `explain_tool`, `search_tools`, `tooling_status`, `plan_install`). It can never install anything; `plan_install` only shows the plan and the command for you to run.
